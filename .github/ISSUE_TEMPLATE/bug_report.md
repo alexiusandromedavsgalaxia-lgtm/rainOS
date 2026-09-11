@@ -6,34 +6,39 @@ labels: ["bug", "needs-triage"]
 assignees: []
 ---
 
-## Descripción
+## Description
 
-<!-- Qué ocurre. Sé concreto. -->
+<!-- What's up. Be specific. -->
 
-## Pasos para reproducir
+## Steps to reproduce
 
 1.
+
 2.
+
 3.
 
-## Comportamiento esperado
+## Expected behavior
 
-<!-- Qué esperabas que ocurriese -->
+<!-- What did you expect to happen -->
 
-## Comportamiento actual
+## Current behavior
 
-<!-- Qué ocurre en realidad -->
+<!-- What really happens -->
 
-## Entorno
+## Environment
 
-- **Versión de rainOS**:
-- **Versión de React**:
-- **Navegador**: (Chrome 120, Firefox 122, Safari 17, ...)
-- **Sistema operativo**: (macOS 14, Windows 11, Ubuntu 22.04, ...)
-- **Node.js**: (solo si aplica)
+- **Version of rainOS**:
 
-## Módulo afectado
+- **React version**:
 
+- **Navigator**: (Chrome 120, Firefox 122, Safari 17, ...)
+
+- **Operating system**: (macOS 14, Windows 11, Ubuntu 22.04, ...)
+
+- **Node.js**: (only if applicable)
+
+## Affected module
 - [ ] `kernel`
 - [ ] `bootstrap`
 - [ ] `bootloader`
@@ -43,7 +48,24 @@ assignees: []
 - [ ] `initsystem`
 - [ ] `lockscreen`
 
-## Código mínimo reproducible
+## Minimum Playable Code
 
-```jsx
-// Pega aquí el código que reproduce el bug
+jsx
+-
+Logs / errors
+
+Text
+
+Paste the console logs or the stack trace here
+
+Does it affect the start?
+
+□ Yes, it won't start
+
+□ Yes, it starts in safe mode
+
+□ No, it starts but with strange behavior
+
+Additional context
+
+<!-- Any extra information that can help -->
