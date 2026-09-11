@@ -8,9 +8,8 @@ chrome built with `useDraggable` and `useResizable`.
 From the repo root:
 
 ```bash
-npm run dev```
-
-
+npm run dev
+```
 Then open http://localhost:5173.
 
 What you can do
