@@ -220,4 +220,204 @@ describe("WindowManager", () => {
       expect(wm.getWindow(id).state).toBe(WINDOW_STATE.MINIMIZED);
     });
 
-    it("restores a minimized window",
+    it("restores a minimized window", () => {
+      const id = wm.open({ title: "Test", x: 100, y: 200 });
+      wm.minimize(id);
+      wm.restore(id);
+      const win = wm.getWindow(id);
+      expect(win.state).toBe(WINDOW_STATE.NORMAL);
+      expect(win.x).toBe(100);
+      expect(win.y).toBe(200);
+    });
+
+    it("removes the window from the focus stack when minimized", () => {
+      const id = wm.open({ title: "Test" });
+      wm.minimize(id);
+      expect(wm.getActive()).toBeNull();
+    });
+
+    it("toggleMinimize flips the state", () => {
+      const id = wm.open({ title: "Test" });
+      wm.toggleMinimize(id);
+      expect(wm.getWindow(id).state).toBe(WINDOW_STATE.MINIMIZED);
+      wm.toggleMinimize(id);
+      expect(wm.getWindow(id).state).toBe(WINDOW_STATE.NORMAL);
+    });
+  });
+
+  // -------------------------------------------------------------- maximize
+  describe("toggleMaximize", () => {
+    it("maximizes a window", () => {
+      const id = wm.open({ title: "Test" });
+      wm.toggleMaximize(id);
+      const win = wm.getWindow(id);
+      expect(win.state).toBe(WINDOW_STATE.MAXIMIZED);
+      expect(win.width).toBe(VIEWPORT.width);
+      expect(win.y).toBe(TOP_RESERVED);
+    });
+
+    it("restores the previous size when toggled back", () => {
+      const id = wm.open({ title: "Test", width: 500, height: 400 });
+      wm.toggleMaximize(id);
+      wm.toggleMaximize(id);
+      const win = wm.getWindow(id);
+      expect(win.width).toBe(500);
+      expect(win.height).toBe(400);
+    });
+  });
+
+  // ------------------------------------------------------------- fullscreen
+  describe("toggleFullscreen", () => {
+    it("goes fullscreen", () => {
+      const id = wm.open({ title: "Test" });
+      wm.toggleFullscreen(id);
+      const win = wm.getWindow(id);
+      expect(win.state).toBe(WINDOW_STATE.FULLSCREEN);
+      expect(win.width).toBe(VIEWPORT.width);
+      expect(win.height).toBe(VIEWPORT.height);
+      expect(win.x).toBe(0);
+      expect(win.y).toBe(0);
+    });
+  });
+
+  // -------------------------------------------------------------- hit test
+  describe("hitTest", () => {
+    it("returns the topmost window under a point", () => {
+      const a = wm.open({ title: "A", x: 0, y: 0, width: 500, height: 500 });
+      const b = wm.open({
+        title: "B",
+        x: 300,
+        y: 300,
+        width: 500,
+        height: 500,
+      });
+      // Point inside both windows: topmost is B (focused last)
+      expect(wm.hitTest(350, 350)).toBe(b);
+      // Point only inside A
+      expect(wm.hitTest(50, 50)).toBe(a);
+    });
+
+    it("ignores minimized windows", () => {
+      const id = wm.open({ title: "Test", x: 0, y: 0 });
+      wm.minimize(id);
+      expect(wm.hitTest(100, 100)).toBeNull();
+    });
+
+    it("returns null when nothing is under the point", () => {
+      wm.open({ title: "Test", x: 0, y: 0, width: 100, height: 100 });
+      expect(wm.hitTest(500, 500)).toBeNull();
+    });
+  });
+
+  // ------------------------------------------------------------ viewport
+  describe("setViewport", () => {
+    it("reflows windows to fit the new viewport", () => {
+      const id = wm.open({
+        title: "Test",
+        x: VIEWPORT.width - 100,
+        y: 200,
+        width: 500,
+        height: 400,
+      });
+      wm.setViewport({ width: 800, height: 600 });
+      const win = wm.getWindow(id);
+      expect(win.x).toBeLessThanOrEqual(800);
+    });
+  });
+
+  // ------------------------------------------------------------- persistence
+  describe("serialize and hydrate", () => {
+    it("round-trips a window list", () => {
+      const a = wm.open({ title: "A", width: 500, height: 400 });
+      const b = wm.open({ title: "B", x: 100, y: 100 });
+      const json = wm.serialize();
+
+      const wm2 = new WindowManager({ viewport: VIEWPORT });
+      wm2.hydrate(json);
+
+      const winA = wm2.getWindow(a);
+      const winB = wm2.getWindow(b);
+      expect(winA.title).toBe("A");
+      expect(winA.width).toBe(500);
+      expect(winB.title).toBe("B");
+      expect(winB.x).toBe(100);
+    });
+
+    it("preserves the active window", () => {
+      const a = wm.open({ title: "A" });
+      const b = wm.open({ title: "B" });
+      wm.focus(a);
+      const json = wm.serialize();
+
+      const wm2 = new WindowManager({ viewport: VIEWPORT });
+      wm2.hydrate(json);
+      expect(wm2.getActive().id).toBe(a);
+    });
+  });
+
+  // ---------------------------------------------------------------- queries
+  describe("queries", () => {
+    it("getByApp returns only matching windows", () => {
+      wm.open({ title: "A", appId: "app-a" });
+      wm.open({ title: "B", appId: "app-b" });
+      wm.open({ title: "C", appId: "app-a" });
+      expect(wm.getByApp("app-a")).toHaveLength(2);
+      expect(wm.getByApp("app-b")).toHaveLength(1);
+    });
+
+    it("getVisibleWindows excludes minimized", () => {
+      const a = wm.open({ title: "A" });
+      const b = wm.open({ title: "B" });
+      wm.minimize(a);
+      expect(wm.getVisibleWindows()).toHaveLength(1);
+      expect(wm.getVisibleWindows()[0].id).toBe(b);
+    });
+
+    it("getMinimizedWindows returns only minimized", () => {
+      const a = wm.open({ title: "A" });
+      wm.open({ title: "B" });
+      wm.minimize(a);
+      expect(wm.getMinimizedWindows()).toHaveLength(1);
+      expect(wm.getMinimizedWindows()[0].id).toBe(a);
+    });
+
+    it("count returns the number of windows", () => {
+      wm.open({ title: "A" });
+      wm.open({ title: "B" });
+      expect(wm.count()).toBe(2);
+    });
+
+    it("has returns true for existing windows", () => {
+      const id = wm.open({ title: "Test" });
+      expect(wm.has(id)).toBe(true);
+      expect(wm.has(9999)).toBe(false);
+    });
+  });
+
+  // --------------------------------------------------------------- metadata
+  describe("metadata", () => {
+    it("stores and retrieves metadata", () => {
+      const id = wm.open({ title: "Test" });
+      wm.setMetadata(id, { tag: "beta" });
+      expect(wm.getMetadata(id)).toEqual({ tag: "beta" });
+    });
+
+    it("returns null for non-existent metadata", () => {
+      expect(wm.getMetadata(9999)).toBeNull();
+    });
+  });
+
+  // ----------------------------------------------------------------- batch
+  describe("batch", () => {
+    it("notifies subscribers only once per batch", () => {
+      let calls = 0;
+      wm.subscribe(() => calls++);
+      wm.batch(() => {
+        wm.open({ title: "A" });
+        wm.open({ title: "B" });
+        wm.open({ title: "C" });
+      });
+      expect(calls).toBe(1);
+    });
+  });
+});
