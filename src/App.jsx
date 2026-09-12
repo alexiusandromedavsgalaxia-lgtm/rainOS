@@ -44,6 +44,7 @@ import { BootstrapProvider } from "./bootstrap/bootstrap.jsx";
 import { BootLoaderProvider } from "./bootloader/bootloader.jsx";
 import { SafeBootProvider } from "./safeboot/safeboot.jsx";
 import { SchedulerProvider } from "./scheduler/scheduler.jsx";
+import { kernelBus } from "./kernel/kernel.jsx";
 
 // ─────────────── Instaladores y sistema ───────────────
 import { StartupInstallerProvider } from "./startupinstaller/startupinstaller.jsx";
