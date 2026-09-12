@@ -1,20 +1,21 @@
 // ============================================================================
 // App.jsx — Raíz de rainOS
 // ----------------------------------------------------------------------------
-// Monta todo el sistema operativo:
+// Monta todo el sistema operativo con la cadena de arranque completa.
 //
 //   1. Cadena de arranque:
 //      BootstrapProvider → WindowManagerProvider → SafeBootProvider
-//      → BootLoaderProvider → UpdaterProvider → ToastProvider
-//      → AppInstallerProvider → DMGInstallerProvider
-//      → SchedulerProvider → VcpuProvider → VgpuProvider
-//      → SecurityProvider → RuntimeProvider → LockScreenProvider
+//      → BootLoaderProvider → SchedulerProvider → UpdaterProvider
+//      → ToastProvider → AppInstallerProvider → DMGInstallerProvider
+//      → StartupInstallerProvider → InitialConfigProvider
+//      → LockScreenProvider → RuntimeProvider
 //
-//   2. Sistema de archivos virtual (para que Finder y Terminal lo compartan)
+//   2. Security manager global
 //
 //   3. Runtime de apps con las 8 apps del sistema
+//      (todas viven en src/apps/<app>/<app>.jsx)
 //
-//   4. Todos los providers de UI (menubar, dock, launchpad, etc.)
+//   4. Todos los overlays de UI (menubar, dock, launchpad, ...)
 //
 //   5. Shell principal: Desktop + windows + overlays
 //
@@ -45,8 +46,12 @@ import { DMGInstallerProvider } from "./dmginstaller/dmginstaller.jsx";
 // ─────────────── Seguridad ───────────────
 import { SecurityManager, installSecurityHooks } from "./security/security.jsx";
 
-// ─────────────── Runtime ───────────────
-import { RuntimeProvider, buildSystemApps, useRuntime } from "./runtime/runtime.jsx";
+// ─────────────── Runtime de apps ───────────────
+import {
+  RuntimeProvider,
+  buildSystemApps,
+  useRuntime,
+} from "./runtime/runtime.jsx";
 
 // ─────────────── Bloqueo ───────────────
 import { LockScreenProvider, LockScreenView } from "./lockscreen/lockscreen.jsx";
@@ -63,14 +68,15 @@ import { ControlCenter } from "./controlcenter/controlcenter.jsx";
 import { AppSwitcher } from "./appswitcher/appswitcher.jsx";
 
 // ─────────────── Apps del sistema ───────────────
-import { Finder } from "./apps/finder/finder.jsx";
-import { Safari } from "./apps/safari/safari.jsx";
-import { Music } from "./apps/music/music.jsx";
-import { Photos } from "./apps/photos/photos.jsx";
+// Cada app vive en src/apps/<app>/<app>.jsx
+import { Finder }   from "./apps/finder/finder.jsx";
+import { Safari }   from "./apps/safari/safari.jsx";
+import { Music }    from "./apps/music/music.jsx";
+import { Photos }   from "./apps/photos/photos.jsx";
 import { Terminal } from "./apps/terminal/terminal.jsx";
-import { Notes } from "./apps/notes/notes.jsx";
+import { Notes }    from "./apps/notes/notes.jsx";
 import { Settings } from "./apps/settings/settings.jsx";
-import { About } from "./apps/about/about.jsx";
+import { About }    from "./apps/about/about.jsx";
 
 // ============================================================================
 // APPS DEL SISTEMA
@@ -88,32 +94,33 @@ const SYSTEM_APPS = buildSystemApps({
 });
 
 // ============================================================================
-// SECURITY PROVIDER (instala el SecurityManager global)
+// SECURITY CONTEXT (provider local, no está en un archivo aparte)
 // ============================================================================
 
-function SecurityContext({ security, children }) {
-  return (
-    <SecurityProvider value={security}>
-      {children}
-    </SecurityProvider>
-  );
-}
-
-const SecurityProvider = React.createContext(null);
+const SecurityContext = React.createContext(null);
 
 export function useSecurity() {
-  const ctx = React.useContext(SecurityProvider);
-  if (!ctx) throw new Error("useSecurity must be used within a SecurityContext");
+  const ctx = React.useContext(SecurityContext);
+  if (!ctx) throw new Error("useSecurity must be used within SecurityContext");
   return ctx;
 }
 
+function SecurityProvider({ security, children }) {
+  return (
+    <SecurityContext.Provider value={security}>
+      {children}
+    </SecurityContext.Provider>
+  );
+}
+
 // ============================================================================
-// SHELL (todo lo que se renderiza dentro del sistema ya arrancado)
+// SHELL — todo lo que se renderiza dentro del sistema ya arrancado
 // ============================================================================
 
 function Shell() {
   const wm = useWindowManager();
   const runtime = useRuntime();
+
   const [showLaunchpad, setShowLaunchpad] = useState(false);
   const [showSpotlight, setShowSpotlight] = useState(false);
   const [showNotifications, setShowNotifications] = useState(false);
@@ -121,7 +128,7 @@ function Shell() {
   const [showControlCenter, setShowControlCenter] = useState(false);
   const [showAppSwitcher, setShowAppSwitcher] = useState(false);
 
-  // Atajos globales del shell
+  // ------------------------------------------------------------------ atajos globales
   useEffect(() => {
     const onKey = (e) => {
       const meta = e.metaKey || e.ctrlKey;
@@ -132,24 +139,28 @@ function Shell() {
         setShowLaunchpad((s) => !s);
         return;
       }
+
       // ⌘Space → Spotlight
       if (meta && e.key === " ") {
         e.preventDefault();
         setShowSpotlight((s) => !s);
         return;
       }
+
       // F3 o Ctrl+↑ → Mission Control
       if ((e.key === "F3" && !meta) || (e.ctrlKey && e.key === "ArrowUp")) {
         e.preventDefault();
         setShowMissionControl((s) => !s);
         return;
       }
+
       // ⌘Tab → App Switcher
       if (meta && e.key === "Tab") {
         e.preventDefault();
         setShowAppSwitcher(true);
         return;
       }
+
       // Esc cierra todos los overlays
       if (e.key === "Escape") {
         setShowLaunchpad(false);
@@ -174,7 +185,7 @@ function Shell() {
     };
   }, []);
 
-  // Menús del menubar
+  // ------------------------------------------------------------------ menubar
   const menuBarHandlers = useMemo(
     () => ({
       onOpenControlCenter: () => setShowControlCenter((s) => !s),
@@ -191,7 +202,7 @@ function Shell() {
     [runtime]
   );
 
-  // Apps del dock (por orden)
+  // ------------------------------------------------------------------ dock apps
   const dockApps = useMemo(
     () =>
       [
@@ -223,7 +234,15 @@ function Shell() {
           name: a.name,
           emoji: a.icon,
         }))}
-        pinned={["finder", "safari", "music", "photos", "terminal", "notes", "settings"]}
+        pinned={[
+          "finder",
+          "safari",
+          "music",
+          "photos",
+          "terminal",
+          "notes",
+          "settings",
+        ]}
         trash={{ id: "trash", name: "Papelera", emoji: "🗑️" }}
         onAppClick={(app) => runtime.focusOrLaunch(app.id)}
         onTrashClick={() => console.log("[dock] trash")}
@@ -313,26 +332,22 @@ function Shell() {
 }
 
 // ============================================================================
-// BOOT GATE (controla qué se muestra según la fase del sistema)
+// BOOT GATE — controla qué se muestra según la fase del sistema
 // ============================================================================
 
 function BootGate() {
-  const [booted, setBooted] = useState(false);
   const [security, setSecurity] = useState(null);
   const [showInit, setShowInit] = useState(true);
-  const [ready, setReady] = useState(false);
 
   // Instalar seguridad al arrancar
   useEffect(() => {
     const sec = new SecurityManager({ keychainName: "login" });
-    // Activar FileVault y bloquear al arrancar
     sec.fileVault.enable();
     sec.fileVault.setPassword("rainos-default-password");
     sec.fileVault.lock();
-    // Instalar hooks de seguridad
     installSecurityHooks({ security: sec });
     setSecurity(sec);
-    // Simular desbloqueo (en un SO real, pediría contraseña)
+    // Simular desbloqueo (en un SO real pediría contraseña)
     setTimeout(() => sec.fileVault.unlock("rainos-default-password"), 500);
   }, []);
 
@@ -340,7 +355,6 @@ function BootGate() {
   useEffect(() => {
     const t = setTimeout(() => {
       setShowInit(false);
-      setBooted(true);
     }, 2600);
     return () => clearTimeout(t);
   }, []);
@@ -348,7 +362,7 @@ function BootGate() {
   if (!security) return null;
 
   return (
-    <SecurityContext security={security}>
+    <SecurityProvider security={security}>
       <RuntimeProvider apps={SYSTEM_APPS} security={security}>
         {showInit ? (
           <ConnectedInitSystem onFinished={() => setShowInit(false)} />
@@ -356,12 +370,12 @@ function BootGate() {
           <Shell />
         )}
       </RuntimeProvider>
-    </SecurityContext>
+    </SecurityProvider>
   );
 }
 
 // ============================================================================
-// APP (árbol de providers completo)
+// APP — árbol completo de providers
 // ============================================================================
 
 export default function App() {
