@@ -158,36 +158,82 @@ class QARMA64 {
     }
     this.key = BigInt.asUintN(128, key);
 
-    // S-box (α) — tomada del paper de QARMA
-    this.S = new Uint8Array([
-      0x0, 0x1, 0x2, 0x3, 0x4, 0x5, 0x6, 0x7,
-      0x8, 0x9, 0xa, 0xb, 0xc, 0xd, 0xe, 0xf,
-      0x4, 0x5, 0x6, 0x7, 0x8, 0x9, 0xa, 0xb,
-      0xc, 0xd, 0xe, 0xf, 0x0, 0x1, 0x2, 0x3,
-      // ... (S-box completa de 256 entradas; abreviada aquí por espacio)
-    ]);
+    // S-box (α) de 256 entradas, generada como una permutación biyectiva
+    // real (byte i → byte S[i], única y por tanto invertible) mediante un
+    // barajado determinista Fisher-Yates con semilla fija. No es la
+    // S-box exacta del paper de QARMA (esto sigue siendo la
+    // implementación "didáctica" que ya declara este archivo), pero a
+    // diferencia de la versión anterior SÍ es una permutación válida:
+    // cada valor de entrada 0..255 mapea a un valor de salida distinto,
+    // condición necesaria para que _invS (la inversa) exista.
+    this.S = QARMA64._buildSbox();
+    this.invS = QARMA64._invertSbox(this.S);
 
     // Rondas
     this.rounds = 7;
   }
 
+  static _buildSbox() {
+    const s = new Uint8Array(256);
+    for (let i = 0; i < 256; i++) s[i] = i;
+    // Fisher-Yates con LCG determinista (misma salida siempre, sin
+    // depender de Math.random) — solo para tener una permutación fija
+    // y reproducible, no aleatoriedad criptográfica real.
+    let state = 0x51ed270b;
+    const next = () => {
+      state = (Math.imul(state, 1664525) + 1013904223) >>> 0;
+      return state;
+    };
+    for (let i = 255; i > 0; i--) {
+      const j = next() % (i + 1);
+      const tmp = s[i]; s[i] = s[j]; s[j] = tmp;
+    }
+    return s;
+  }
+
+  static _invertSbox(s) {
+    const inv = new Uint8Array(256);
+    for (let i = 0; i < 256; i++) inv[s[i]] = i;
+    return inv;
+  }
+
   _substituteByte(b) {
-    return this.S[b & 0xff] ?? b;
+    return this.S[b & 0xff];
+  }
+
+  _invSubstituteByte(b) {
+    return this.invS[b & 0xff];
   }
 
   _substituteCell(x) {
-    // QARMA opera sobre celdas de 16 bits
+    // Sustitución byte a byte sobre el bloque de 64 bits (8 bytes)
+    // usando la S-box directa.
     let out = 0n;
-    for (let i = 0; i < 16; i++) {
+    for (let i = 0; i < 8; i++) {
       const byte = Number((x >> BigInt(i * 8)) & 0xffn);
       out |= BigInt(this._substituteByte(byte)) << BigInt(i * 8);
     }
     return out;
   }
 
+  _invSubstituteCell(x) {
+    // Inversa real de _substituteCell, usando la S-box invertida.
+    let out = 0n;
+    for (let i = 0; i < 8; i++) {
+      const byte = Number((x >> BigInt(i * 8)) & 0xffn);
+      out |= BigInt(this._invSubstituteByte(byte)) << BigInt(i * 8);
+    }
+    return out;
+  }
+
   _rotateCell(x) {
-    // Rotación de la celda de 16 bits
-    return ((x << 4n) | (x >> 12n)) & 0xffffn;
+    // Rotación circular a la izquierda de todo el bloque de 64 bits.
+    return u64((x << 4n) | (x >> 60n));
+  }
+
+  _invRotateCell(x) {
+    // Inversa exacta de _rotateCell: rotación a la derecha.
+    return u64((x >> 4n) | (x << 60n));
   }
 
   _mixColumns(x) {
@@ -216,8 +262,14 @@ class QARMA64 {
   }
 
   decrypt(block) {
-    // Inversa trivial para nuestra implementación (los test vectors
-    // verifican unicidad de ida/vuelta con la MISMA clave)
+    // Inversa real de encrypt(): deshace cada ronda con las operaciones
+    // inversas exactas (S-box invertida, rotación al revés), en orden
+    // inverso al de encrypt. encrypt() hace, por ronda:
+    //   XOR(k0) → sub → rot → mix → XOR(k1+r)
+    // decrypt() deshace cada ronda en orden inverso:
+    //   XOR(k1+r) → mix⁻¹ → rot⁻¹ → sub⁻¹ → XOR(k0)
+    // _mixColumns es su propia inversa (solo reordena celdas, no altera
+    // bits), así que no hace falta una versión "inv" separada para ella.
     let state = BigInt.asUintN(64, block);
     const k0 = BigInt.asUintN(64, this.key);
     const k1 = BigInt.asUintN(64, this.key >> 64n);
@@ -225,8 +277,8 @@ class QARMA64 {
     for (let r = this.rounds - 1; r >= 0; r--) {
       state = u64(state ^ (k1 + BigInt(r)));
       state = this._mixColumns(state);
-      state = this._rotateCell(state);
-      state = this._substituteCell(state);
+      state = this._invRotateCell(state);
+      state = this._invSubstituteCell(state);
       state = u64(state ^ k0);
     }
     return state;
