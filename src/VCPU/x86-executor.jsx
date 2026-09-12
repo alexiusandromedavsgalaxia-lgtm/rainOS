@@ -949,6 +949,7 @@ export class X86Executor {
       const { reg, modrm } = this._decodeModRM();
       const imm = i8(this.fetchByte());
       const a = this._readModRMValue(modrm);
+      this._clearPrefixes();
       switch (reg) {
         case 0: { const r = u32(a + imm); this._setFlagsAdd(a, u32(imm), r, 32); this._writeModRMValue(modrm, r); return { mnemonic: "add r/m32, imm8", cycles: 1 }; }
         case 5: { const r = u32(a - imm); this._setFlagsSub(a, u32(imm), r, 32); this._writeModRMValue(modrm, r); return { mnemonic: "sub r/m32, imm8", cycles: 1 }; }
@@ -982,6 +983,7 @@ export class X86Executor {
     if (op === 0xff) {
       const { reg, modrm } = this._decodeModRM();
       const v = this._readModRMValue(modrm);
+      this._clearPrefixes();
       switch (reg) {
         case 0: { const r = u32(v + 1); this._setFlagsAdd(v, 1, r, 32); this._writeModRMValue(modrm, r); return { mnemonic: "inc r/m32", cycles: 1 }; }
         case 1: { const r = u32(v - 1); this._setFlagsSub(v, 1, r, 32); this._writeModRMValue(modrm, r); return { mnemonic: "dec r/m32", cycles: 1 }; }
