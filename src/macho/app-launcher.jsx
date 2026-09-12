@@ -1,552 +1,1071 @@
 // ============================================================================
-// app-launcher.jsx — Lanzador de apps Mach-O
+// app-launcher.jsx — Lanzador de binarios Mach-O
 // ----------------------------------------------------------------------------
-// El pegamento entre el sistema operativo (rainOS) y una app de macOS real.
+// Este módulo es el ÚLTIMO eslabón de la cadena de ejecución:
 //
-// Flujo completo:
+//   importer.jsx      → parsea el Mach-O, resuelve imports
+//   dyld.jsx          → resuelve símbolos, reubica, enlaza librerías
+//   objc-runtime.jsx  → registra clases/métodos/protocolos
+//   swift-runtime.jsx → registra metadata Swift, protocol conformances
+//   libsystem.jsx     → expone la libc + libsystem_* al binario
+//   corefoundation.jsx→ expone CF* al binario
+//   app-launcher.jsx  → EJECUTA el binario  ← este archivo
 //
-//   1. Recibe bytes de un .app (o .dmg, o un binario suelto)
-//   2. Detecta el Info.plist → identifica CFBundleExecutable
-//   3. Extrae el binario Mach-O del bundle
-//   4. Crea una VCPU nueva para este proceso
-//   5. Instancia un Dyld con todos los subsistemas
-//   6. Carga el binario + dependencias
-//   7. Linkea, resuelve símbolos, ejecuta constructores
-//   8. Llama a main()
-//   9. Renderiza el output (si es GUI → se conecta al VGPU)
+// Responsabilidades:
+//   - Construir el entorno de proceso (argc/argv/envp, stack inicial)
+//   - Invocar el entry point (LC_MAIN o LC_UNIXTHREAD → _main / _start)
+//   - Gestionar ciclo de vida: task_t, PID, threads, exit code
+//   - Cargar frameworks del sistema bajo demanda
+//   - Emitir eventos de ciclo de vida en kernelBus
 //
-// El launcher expone una API simple:
-//   await launch({ bundleBytes, vcpu, onOutput })
+// Convención:
+//   - Clase pura `AppLauncher` sin React.
+//   - Provider React fino (`AppLauncherProvider`) + hook `useAppLauncher()`.
+//   - Todos los accesos externos con `?.()`.
 // ============================================================================
+
+import React, {
+  createContext,
+  useContext,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 
 import { kernelBus } from "../kernel/kernel.jsx";
-import { VCPU } from "../vcpu/vcpu.jsx";
-import { Dyld } from "./dyld.jsx";
-import { createExecutor } from "./xcode-executor.jsx";
-import { MachoParser } from "./macho-loader.jsx";
+import { MachOParser } from "./importer.jsx";
+import { DyldLoader } from "./dyld.jsx";
+import { ObjCRuntime } from "./objc-runtime.jsx";
+import { SwiftRuntime } from "./swift-runtime.jsx";
+import { LibSystem } from "./libsystem.jsx";
+import { CoreFoundation } from "./corefoundation.jsx";
 
-export const LAUNCHER_EVENTS = Object.freeze({
-  BUNDLE_RECEIVED: "launcher:bundle-received",
-  INFO_PARSED: "launcher:info-parsed",
-  EXECUTABLE_FOUND: "launcher:executable-found",
-  PROCESS_SPAWNED: "launcher:process-spawned",
-  READY: "launcher:ready",
-  OUTPUT: "launcher:output",
-  EXITED: "launcher:exited",
-  CRASHED: "launcher:crashed",
-  LOG: "launcher:log",
+// ============================================================================
+// CONSTANTES
+// ============================================================================
+
+// Valores tomados de <mach-o/loader.h> y <sys/errno.h>
+const LC_REQ_DYLD           = 0x80000000;
+const LC_MAIN               = 0x28 | LC_REQ_DYLD;
+const LC_UNIXTHREAD         = 0x05;
+const LC_LOAD_DYLIB         = 0x0c;
+const LC_LOAD_WEAK_DYLIB    = 0x18 | LC_REQ_DYLD;
+const LC_REEXPORT_DYLIB     = 0x1f | LC_REQ_DYLD;
+const LC_ID_DYLIB           = 0x0d;
+
+const MH_EXECUTE            = 0x2;
+const MH_DYLIB              = 0x6;
+const MH_BUNDLE             = 0x8;
+
+const CPU_TYPE_ARM64         = 0x0100000c;
+const CPU_TYPE_X86_64        = 0x01000007;
+
+// Estados del proceso
+const PROC_STATE = Object.freeze({
+  NEW:         "new",
+  LOADING:     "loading",
+  LINKING:     "linking",
+  READY:       "ready",
+  RUNNING:     "running",
+  EXITED:      "exited",
+  CRASHED:     "crashed",
+  ZOMBIE:      "zombie",
 });
 
-class LauncherLogger {
-  constructor(max = 500) {
-    this.max = max;
-    this.entries = [];
-  }
-  push(level, message, meta) {
-    const e = { ts: Date.now(), level, message, meta: meta ?? null };
-    this.entries.push(e);
-    if (this.entries.length > this.max) this.entries.shift();
-    kernelBus.emit(LAUNCHER_EVENTS.LOG, e);
-  }
-  info(m, x) { this.push("info", m, x); }
-  warn(m, x) { this.push("warn", m, x); }
-  error(m, x) { this.push("error", m, x); }
+// Códigos de salida
+const EXIT_SUCCESS = 0;
+const EXIT_FAILURE = 1;
+const EXIT_CRASHED = 139; // 128 + SIGSEGV
+const EXIT_KILLED  = 137; // 128 + SIGKILL
+
+// Frameworks que sabemos cargar bajo demanda
+const SYSTEM_FRAMEWORKS = Object.freeze({
+  Foundation:        "/System/Library/Frameworks/Foundation.framework/Foundation",
+  AppKit:            "/System/Library/Frameworks/AppKit.framework/AppKit",
+  UIKit:             "/System/Library/Frameworks/UIKit.framework/UIKit",
+  SwiftUI:           "/System/Library/Frameworks/SwiftUI.framework/SwiftUI",
+  CoreFoundation:    "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation",
+  CoreGraphics:      "/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics",
+  CoreAudio:         "/System/Library/Frameworks/CoreAudio.framework/CoreAudio",
+  CoreVideo:         "/System/Library/Frameworks/CoreVideo.framework/CoreVideo",
+  CoreImage:         "/System/Library/Frameworks/CoreImage.framework/CoreImage",
+  AVFoundation:      "/System/Library/Frameworks/AVFoundation.framework/AVFoundation",
+  Metal:             "/System/Library/Frameworks/Metal.framework/Metal",
+  MetalKit:          "/System/Library/Frameworks/MetalKit.framework/MetalKit",
+  Network:           "/System/Library/Frameworks/Network.framework/Network",
+  Security:          "/System/Library/Frameworks/Security.framework/Security",
+  IOKit:             "/System/Library/Frameworks/IOKit.framework/IOKit",
+  WebKit:            "/System/Library/Frameworks/WebKit.framework/WebKit",
+  Combine:           "/System/Library/Frameworks/Combine.framework/Combine",
+});
+
+// ============================================================================
+// UTILIDADES
+// ============================================================================
+
+let _pidCounter = 100;
+const nextPid = () => ++_pidCounter;
+
+const now = () =>
+  typeof performance !== "undefined" && performance.now
+    ? performance.now()
+    : Date.now();
+
+/**
+ * Convierte una Uint8Array en string ASCII, cortando en el primer NUL.
+ */
+function readCString(bytes, offset = 0) {
+  let end = offset;
+  while (end < bytes.length && bytes[end] !== 0) end++;
+  return String.fromCharCode(...bytes.subarray(offset, end));
+}
+
+/**
+ * Convierte un string a Uint8Array con terminador NUL.
+ */
+function writeCString(str) {
+  const out = new Uint8Array(str.length + 1);
+  for (let i = 0; i < str.length; i++) out[i] = str.charCodeAt(i) & 0xff;
+  out[str.length] = 0;
+  return out;
+}
+
+/**
+ * Formatea bytes como hex para logs.
+ */
+function hex(n, pad = 8) {
+  return "0x" + (n >>> 0).toString(16).padStart(pad, "0");
 }
 
 // ============================================================================
-// PLIST PARSER (binario + XML)
+// CLASE PURA: AppProcess — representa un proceso en ejecución
 // ============================================================================
 
-export class PlistParser {
-  static parse(data) {
-    if (typeof data === "string") return this._parseXML(data);
-    const bytes = data instanceof Uint8Array ? data : new Uint8Array(data);
-    // Detectar binario
-    if (bytes.length >= 8) {
-      const magic = String.fromCharCode(...bytes.slice(0, 6));
-      if (magic === "bplist") return this._parseBinary(bytes);
-    }
-    const text = new TextDecoder().decode(bytes);
-    return this._parseXML(text);
+export class AppProcess {
+  constructor({ pid, path, argv, envp, task, macho, dyld, objc, swift }) {
+    this.pid = pid ?? nextPid();
+    this.path = path;
+    this.argv = argv ?? [path];
+    this.envp = envp ?? {};
+    this.task = task ?? null;      // task_t virtual
+    this.macho = macho;
+    this.dyld = dyld;
+    this.objc = objc;
+    this.swift = swift;
+
+    this.state = PROC_STATE.NEW;
+    this.exitCode = null;
+    this.exitSignal = null;
+
+    this.startedAt = null;
+    this.endedAt = null;
+
+    this.threads = new Map();
+    this.mainThreadId = 1;
+    this._threadCounter = 1;
+
+    this.frameworks = new Set();
+    this.handles = new Map();      // fd → { kind, target }
+
+    this._listeners = new Set();
   }
 
-  static _parseXML(xml) {
-    // Simple XML plist parser (no usa DOMParser para portabilidad)
-    const out = {};
-    const tagRe = /<(\/?)(\w+)[^>]*>([^<]*)<\/\2>|<(\w+)\/>/g;
+  // ---------------------------------------------------------------- estado
 
-    // Simplificación: solo soporta <key>...</key> seguido de un valor
-    const lines = xml.split(/<(?=\w)/).map((l) => "<" + l.trim());
-    let i = 0;
-    const parseValue = (str) => {
-      if (str.startsWith("<string>")) {
-        const m = str.match(/<string>([\s\S]*?)<\/string>/);
-        return m ? m[1] : "";
-      }
-      if (str.startsWith("<integer>")) {
-        const m = str.match(/<integer>([\s\S]*?)<\/integer>/);
-        return m ? parseInt(m[1], 10) : 0;
-      }
-      if (str.startsWith("<real>")) {
-        const m = str.match(/<real>([\s\S]*?)<\/real>/);
-        return m ? parseFloat(m[1]) : 0;
-      }
-      if (str.startsWith("<true")) return true;
-      if (str.startsWith("<false")) return false;
-      if (str.startsWith("<array>")) {
-        const items = [];
-        const inner = str.slice(7, -8);
-        const parts = inner.split("<").map((p) => "<" + p);
-        for (const p of parts) {
-          if (p.length > 1) items.push(parseValue(p));
-        }
-        return items;
-      }
-      if (str.startsWith("<dict>")) {
-        const dict = {};
-        const inner = str.slice(6, -7);
-        const entries = inner.split("<key>").filter(Boolean);
-        for (const e of entries) {
-          const keyMatch = e.match(/^([^<]*)<\/key>([\s\S]*)$/);
-          if (keyMatch) {
-            dict[keyMatch[1]] = parseValue("<" + keyMatch[2]);
-          }
-        }
-        return dict;
-      }
-      return null;
-    };
+  setState(next) {
+    const prev = this.state;
+    if (prev === next) return;
+    this.state = next;
 
-    const topMatch = xml.match(/<dict>([\s\S]*)<\/dict>/);
-    if (topMatch) {
-      return parseValue("<dict>" + topMatch[1] + "</dict>");
+    if (next === PROC_STATE.RUNNING && !this.startedAt) {
+      this.startedAt = now();
     }
-    return out;
-  }
-
-  static _parseBinary(bytes) {
-    // Binary plist parser completo (simplificado)
-    // Header: "bplist00" + offset table + object table
-    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-    const magic = String.fromCharCode(...bytes.slice(0, 8));
-    if (magic !== "bplist00" && !magic.startsWith("bplist")) {
-      throw new Error("invalid binary plist");
+    if (
+      (next === PROC_STATE.EXITED ||
+        next === PROC_STATE.CRASHED ||
+        next === PROC_STATE.ZOMBIE) &&
+      !this.endedAt
+    ) {
+      this.endedAt = now();
     }
 
-    // El trailer está en los últimos 32 bytes
-    const trailerOffset = bytes.length - 32;
-    const offsetIntSize = view.getUint8(trailerOffset + 6);
-    const objectRefSize = view.getUint8(trailerOffset + 7);
-    const numObjects = Number(view.getBigUint64(trailerOffset + 8));
-    const topObject = Number(view.getBigUint64(trailerOffset + 16));
-    const offsetTableOffset = Number(view.getBigUint64(trailerOffset + 24));
-
-    const readOffset = (index) => {
-      const off = offsetTableOffset + index * offsetIntSize;
-      let v = 0;
-      for (let i = 0; i < offsetIntSize; i++) {
-        v = (v << 8) | view.getUint8(off + i);
-      }
-      return v;
-    };
-
-    const readObject = (index, depth = 0) => {
-      if (depth > 100) return null;
-      const off = readOffset(index);
-      const marker = view.getUint8(off);
-      const type = marker >> 4;
-      const info = marker & 0xf;
-
-      switch (type) {
-        case 0x0: {
-          if (info === 0x0) return null;
-          if (info === 0x8) return false;
-          if (info === 0x9) return true;
-          return null;
-        }
-        case 0x1: { // int
-          const size = 1 << info;
-          let v = 0n;
-          for (let i = 0; i < size; i++) {
-            v = (v << 8n) | BigInt(view.getUint8(off + 1 + i));
-          }
-          return Number(v);
-        }
-        case 0x2: { // real
-          const size = 1 << info;
-          if (size === 4) return view.getFloat32(off + 1, false);
-          return view.getFloat64(off + 1, false);
-        }
-        case 0x3: { // date
-          const seconds = view.getFloat64(off + 1, false);
-          return new Date((seconds + 978307200) * 1000);
-        }
-        case 0x4: { // data
-          const len = info === 0xf
-            ? (() => {
-                const sizeMarker = view.getUint8(off + 1);
-                const sizeSize = 1 << (sizeMarker & 0xf);
-                let v = 0;
-                for (let i = 0; i < sizeSize; i++) v = (v << 8) | view.getUint8(off + 2 + i);
-                return v;
-              })()
-            : info;
-          const dataStart = info === 0xf ? off + 2 + (1 << (view.getUint8(off + 1) & 0xf)) : off + 1;
-          return bytes.slice(dataStart, dataStart + len);
-        }
-        case 0x5: { // ASCII string
-          const len = info === 0xf
-            ? (() => {
-                const sizeMarker = view.getUint8(off + 1);
-                const sizeSize = 1 << (sizeMarker & 0xf);
-                let v = 0;
-                for (let i = 0; i < sizeSize; i++) v = (v << 8) | view.getUint8(off + 2 + i);
-                return v;
-              })()
-            : info;
-          const strStart = info === 0xf ? off + 2 + (1 << (view.getUint8(off + 1) & 0xf)) : off + 1;
-          return String.fromCharCode(...bytes.slice(strStart, strStart + len));
-        }
-        case 0x6: { // UTF-16 string
-          const len = info === 0xf ? view.getUint8(off + 2) : info;
-          const strStart = info === 0xf ? off + 3 : off + 1;
-          let s = "";
-          for (let i = 0; i < len; i++) {
-            s += String.fromCharCode(view.getUint16(strStart + i * 2, false));
-          }
-          return s;
-        }
-        case 0xa: { // array
-          const count = info === 0xf
-            ? (() => {
-                const sizeMarker = view.getUint8(off + 1);
-                const sizeSize = 1 << (sizeMarker & 0xf);
-                let v = 0;
-                for (let i = 0; i < sizeSize; i++) v = (v << 8) | view.getUint8(off + 2 + i);
-                return v;
-              })()
-            : info;
-          const arrStart = info === 0xf ? off + 2 + (1 << (view.getUint8(off + 1) & 0xf)) : off + 1;
-          const items = [];
-          for (let i = 0; i < count; i++) {
-            let ref = 0;
-            for (let j = 0; j < objectRefSize; j++) {
-              ref = (ref << 8) | view.getUint8(arrStart + i * objectRefSize + j);
-            }
-            items.push(readObject(ref, depth + 1));
-          }
-          return items;
-        }
-        case 0xd: { // dict
-          const count = info === 0xf
-            ? (() => {
-                const sizeMarker = view.getUint8(off + 1);
-                const sizeSize = 1 << (sizeMarker & 0xf);
-                let v = 0;
-                for (let i = 0; i < sizeSize; i++) v = (v << 8) | view.getUint8(off + 2 + i);
-                return v;
-              })()
-            : info;
-          const dictStart = info === 0xf ? off + 2 + (1 << (view.getUint8(off + 1) & 0xf)) : off + 1;
-          const dict = {};
-          for (let i = 0; i < count; i++) {
-            let keyRef = 0, valRef = 0;
-            for (let j = 0; j < objectRefSize; j++) {
-              keyRef = (keyRef << 8) | view.getUint8(dictStart + i * objectRefSize + j);
-            }
-            for (let j = 0; j < objectRefSize; j++) {
-              valRef = (valRef << 8) | view.getUint8(dictStart + (count + i) * objectRefSize + j);
-            }
-            const key = readObject(keyRef, depth + 1);
-            const val = readObject(valRef, depth + 1);
-            if (key != null) dict[key] = val;
-          }
-          return dict;
-        }
-        default:
-          return null;
-      }
-    };
-
-    return readObject(topObject);
-  }
-}
-
-// ============================================================================
-// BUNDLE EXTRACTOR
-// ============================================================================
-
-export class AppBundle {
-  constructor(bytes) {
-    this.bytes = bytes;
-    this.info = null;
-    this.executable = null;
-    this.resources = new Map();
-  }
-
-  async parse() {
-    // Detectar si es un ZIP (los .app suelen estar comprimidos en un .zip o .dmg)
-    if (this.bytes[0] === 0x50 && this.bytes[1] === 0x4b) {
-      await this._parseZip();
-    } else if (this.bytes[0] === 0xcf && this.bytes[1] === 0xfa) {
-      // Mach-O comprimido o algo así
-      throw new Error("unsupported container format");
-    } else {
-      // Asumimos que es el ejecutable directamente
-      this.executable = this.bytes;
-    }
-    return this;
-  }
-
-  async _parseZip() {
-    // Implementación minimal de ZIP para extraer .app
-    // (usaríamos una librería real en producción)
-    // Aquí hacemos un escaneo de las entradas del ZIP
-    const entries = this._scanZipEntries();
-    for (const entry of entries) {
-      if (entry.name.endsWith("Info.plist")) {
-        this.info = PlistParser.parse(entry.data);
-      } else if (entry.name.includes("Contents/MacOS/")) {
-        this.executable = entry.data;
-        this.executableName = entry.name.split("/").pop();
-      } else {
-        this.resources.set(entry.name, entry.data);
-      }
-    }
-    if (this.info) {
-      kernelBus.emit(LAUNCHER_EVENTS.INFO_PARSED, {
-        bundleId: this.info.CFBundleIdentifier,
-        executable: this.info.CFBundleExecutable,
-      });
-    }
-  }
-
-  _scanZipEntries() {
-    // Escaneo muy básico: buscamos los headers PK\x03\x04
-    const entries = [];
-    let i = 0;
-    while (i < this.bytes.length - 4) {
-      if (this.bytes[i] === 0x50 && this.bytes[i + 1] === 0x4b &&
-          this.bytes[i + 2] === 0x03 && this.bytes[i + 3] === 0x04) {
-        // Central directory entry
-        const view = new DataView(this.bytes.buffer, this.bytes.byteOffset + i);
-        const compression = view.getUint16(8, true);
-        const compressedSize = view.getUint32(18, true);
-        const uncompressedSize = view.getUint32(22, true);
-        const nameLen = view.getUint16(26, true);
-        const extraLen = view.getUint16(28, true);
-        const name = new TextDecoder().decode(this.bytes.slice(i + 30, i + 30 + nameLen));
-        const dataStart = i + 30 + nameLen + extraLen;
-        const data = this.bytes.slice(dataStart, dataStart + compressedSize);
-        entries.push({ name, data, compression, compressedSize });
-        i = dataStart + compressedSize;
-      } else {
-        i++;
-      }
-    }
-    return entries;
-  }
-}
-
-// ============================================================================
-// APP LAUNCHER
-// ============================================================================
-
-export class AppLauncher {
-  constructor({ onOutput = null, onEvent = null } = {}) {
-    this.log = new LauncherLogger();
-    this.onOutput = onOutput;
-    this.onEvent = onEvent;
-    this.running = new Map(); // pid → { vcpu, dyld, executor }
-    this.pidCounter = 100;
-    this.stats = {
-      appsLaunched: 0,
-      appsExited: 0,
-      appsCrashed: 0,
-    };
-  }
-
-  /**
-   * Lanza una app desde bytes de un .app (ZIP) o desde un binario Mach-O directo.
-   *
-   * @param {Object} opts
-   *   - bundleBytes: Uint8Array del .app (ZIP) o del ejecutable
-   *   - bundlePath: ruta del bundle (para @executable_path)
-   *   - argv: argumentos
-   *   - env: variables de entorno
-   *   - libraryResolver: función para resolver dylibs
-   */
-  async launch({
-    bundleBytes,
-    bundlePath = "/Applications/App.app",
-    argv = [],
-    env = {},
-    libraryResolver = null,
-    preferArch = "arm64",
-  }) {
-    const pid = ++this.pidCounter;
-    kernelBus.emit(LAUNCHER_EVENTS.BUNDLE_RECEIVED, { pid, path: bundlePath });
-
-    // 1. Parsear bundle
-    const bundle = await new AppBundle(bundleBytes).parse();
-
-    if (!bundle.executable) {
-      throw new Error("no executable found in bundle");
-    }
-
-    kernelBus.emit(LAUNCHER_EVENTS.EXECUTABLE_FOUND, {
-      pid,
-      name: bundle.executableName || bundle.info?.CFBundleExecutable || "app",
+    kernelBus.emit("process:state-changed", {
+      pid: this.pid,
+      path: this.path,
+      from: prev,
+      to: next,
+      at: now(),
     });
 
-    // 2. Crear VCPU nueva para este proceso
-    const vcpu = new VCPU({ id: pid });
-    vcpu.init();
-
-    // 3. Crear Dyld con todos los subsistemas
-    const dyld = new Dyld({
-      vcpu,
-      searchPaths: [
-        `${bundlePath}/Contents/Frameworks`,
-        `${bundlePath}/Contents/MacOS`,
-        "/usr/lib",
-        "/System/Library/Frameworks",
-      ],
-    });
-    dyld.init();
-
-    // 4. Cargar
-    await dyld.load({
-      mainPath: `${bundlePath}/Contents/MacOS/${bundle.executableName || "App"}`,
-      mainBytes: bundle.executable,
-      mainSlide: 0x100000000n,
-      libraryResolver,
-    });
-
-    // 5. Linkear
-    await dyld.link();
-
-    // 6. Crear executor según arquitectura
-    const mainImage = dyld.mainExecutable;
-    const arch = mainImage.macho.arch;
-    const executor = createExecutor(vcpu, arch);
-
-    // 7. Redirigir syscall write a nuestro callback
-    const originalWrite = executor.syscalls.get(arch.startsWith("arm64") ? 0x04 : 0x2000004);
-    executor.registerSyscall(
-      arch.startsWith("arm64") ? 0x04 : 0x2000004,
-      (cpu) => {
-        const fd = arch.startsWith("arm64")
-          ? Number(cpu.regs.gpr[0])
-          : Number(cpu.regs.gpr[7]);
-        const buf = arch.startsWith("arm64")
-          ? Number(cpu.regs.gpr[1])
-          : Number(cpu.regs.gpr[6]);
-        const count = arch.startsWith("arm64")
-          ? Number(cpu.regs.gpr[2])
-          : Number(cpu.regs.gpr[2]);
-        const bytes = executor.readMemory(buf, count);
-        const text = new TextDecoder().decode(bytes);
-        if (this.onOutput) {
-          try { this.onOutput(text, { pid, fd }); } catch {}
-        } else {
-          console.log(`[app ${pid}]`, text);
-        }
-        kernelBus.emit(LAUNCHER_EVENTS.OUTPUT, { pid, fd, text });
-        cpu.regs.gpr[0] = BigInt(count);
-      }
-    );
-
-    this.running.set(pid, { vcpu, dyld, executor, bundle });
-
-    kernelBus.emit(LAUNCHER_EVENTS.PROCESS_SPAWNED, {
-      pid,
-      arch,
-      bundleId: bundle.info?.CFBundleIdentifier,
-    });
-
-    this.log.info(`process spawned: pid=${pid} arch=${arch}`);
-    this.stats.appsLaunched++;
-
-    // 8. Ejecutar main (en background)
-    this._runAsync(pid, { argv, env });
-
-    return pid;
-  }
-
-  async _runAsync(pid, { argv, env }) {
-    const proc = this.running.get(pid);
-    if (!proc) return;
-    try {
-      const result = await proc.dyld.run({
-        executor: proc.executor,
-        argv,
-        env,
-      });
-
-      kernelBus.emit(LAUNCHER_EVENTS.EXITED, {
-        pid,
-        exitCode: 0,
-        instructions: result.instructions,
-      });
-      this.stats.appsExited++;
-    } catch (err) {
-      kernelBus.emit(LAUNCHER_EVENTS.CRASHED, {
-        pid,
-        error: String(err),
-      });
-      this.log.error(`app crashed (pid ${pid})`, err);
-      this.stats.appsCrashed++;
-    } finally {
-      this.running.delete(pid);
+    for (const fn of this._listeners) {
+      try {
+        fn(next, prev);
+      } catch (_) {}
     }
   }
 
-  kill(pid) {
-    const proc = this.running.get(pid);
-    if (!proc) return false;
-    proc.vcpu.halt();
-    this.running.delete(pid);
+  onStateChange(fn) {
+    this._listeners.add(fn);
+    return () => this._listeners.delete(fn);
+  }
+
+  // ---------------------------------------------------------------- threads
+
+  spawnThread({ name = "pthread", entry = null, arg = null, detached = false } = {}) {
+    const tid = ++this._threadCounter;
+    const thread = {
+      tid,
+      name,
+      entry,
+      arg,
+      detached,
+      state: "running",
+      createdAt: now(),
+      finishedAt: null,
+      cpuTicks: 0,
+      stackSize: 512 * 1024,        // 512 KiB por defecto (como pthread)
+    };
+    this.threads.set(tid, thread);
+    kernelBus.emit("process:thread-spawned", {
+      pid: this.pid,
+      tid,
+      name,
+    });
+    return thread;
+  }
+
+  joinThread(tid) {
+    const thread = this.threads.get(tid);
+    if (!thread) return null;
+    thread.state = "finished";
+    thread.finishedAt = now();
+    kernelBus.emit("process:thread-joined", { pid: this.pid, tid });
+    return thread;
+  }
+
+  // ---------------------------------------------------------------- recursos
+
+  openHandle({ kind, target, mode = "r" }) {
+    const fd = this.handles.size + 3; // 0/1/2 reservados a stdin/stdout/stderr
+    this.handles.set(fd, { kind, target, mode, openedAt: now() });
+    kernelBus.emit("process:handle-opened", {
+      pid: this.pid,
+      fd,
+      kind,
+      target,
+    });
+    return fd;
+  }
+
+  closeHandle(fd) {
+    if (!this.handles.has(fd)) return false;
+    const h = this.handles.get(fd);
+    this.handles.delete(fd);
+    kernelBus.emit("process:handle-closed", {
+      pid: this.pid,
+      fd,
+      kind: h.kind,
+    });
     return true;
   }
 
-  list() {
-    return Array.from(this.running.keys());
+  // ---------------------------------------------------------------- exit
+
+  exit(code = EXIT_SUCCESS) {
+    this.exitCode = code;
+    this.exitSignal = null;
+    this.setState(PROC_STATE.EXITED);
+    kernelBus.emit("process:exited", {
+      pid: this.pid,
+      path: this.path,
+      code,
+      runtimeMs: this.startedAt ? now() - this.startedAt : 0,
+    });
   }
 
-  snapshot() {
+  kill(signal = 9) {
+    this.exitSignal = signal;
+    this.exitCode = null;
+    this.setState(PROC_STATE.ZOMBIE);
+    kernelBus.emit("process:killed", {
+      pid: this.pid,
+      path: this.path,
+      signal,
+    });
+  }
+
+  crash(reason = "unknown") {
+    this.exitCode = EXIT_CRASHED;
+    this.exitSignal = 11; // SIGSEGV
+    this.setState(PROC_STATE.CRASHED);
+    kernelBus.emit("process:crashed", {
+      pid: this.pid,
+      path: this.path,
+      reason,
+    });
+  }
+
+  // ---------------------------------------------------------------- inspect
+
+  toJSON() {
     return {
-      running: this.running.size,
-      pids: this.list(),
-      stats: { ...this.stats },
+      pid: this.pid,
+      path: this.path,
+      argv: this.argv,
+      state: this.state,
+      exitCode: this.exitCode,
+      exitSignal: this.exitSignal,
+      startedAt: this.startedAt,
+      endedAt: this.endedAt,
+      runtimeMs: this.startedAt
+        ? (this.endedAt ?? now()) - this.startedAt
+        : 0,
+      threadCount: this.threads.size,
+      frameworks: [...this.frameworks],
+      handles: [...this.handles.entries()].map(([fd, h]) => ({
+        fd,
+        ...h,
+      })),
     };
   }
 }
 
 // ============================================================================
-// HELPER: render GUI output al VGPU
+// CLASE PURA: AppLauncher — orquestador
 // ============================================================================
 
-export function connectGuiOutput(appLauncher, vgpu) {
-  // Cuando la app llama a CoreGraphics/UIKit/AppKit, se traducen
-  // a operaciones del VGPU. Este helper engancha el sistema.
-  //
-  // En una implementación completa, se registrarían símbolos como:
-  //   - CGContextFillRect → vgpu.commandBuffer.fillRect
-  //   - CGContextDrawImage → vgpu.commandBuffer.drawTexture
-  //   - [UIView drawRect:] → vgpu.commandBuffer.drawQuad
-  //   - [NSView display] → vgpu.commandBuffer.present
-  //
-  // Aquí dejamos un hook básico.
-  return () => {
-    // no-op
-  };
+export class AppLauncher {
+  constructor({ security = null, syslogs = null, verbose = false } = {}) {
+    this.security = security;
+    this.syslogs = syslogs;
+    this.verbose = verbose;
+
+    this.processes = new Map();     // pid → AppProcess
+    this._pidIndex = new Map();     // path → pid (para deduplicar)
+    this._loadedFrameworks = new Set();
+
+    this._stats = {
+      launches: 0,
+      successes: 0,
+      failures: 0,
+      crashes: 0,
+      totalRuntimeMs: 0,
+    };
+  }
+
+  // ---------------------------------------------------------------- log helpers
+
+  _log(level, category, message, payload) {
+    const fn = this.syslogs?.[level];
+    if (typeof fn === "function") {
+      try {
+        fn.call(this.syslogs, "com.rainos.app-launcher", category, message, payload);
+      } catch (_) {}
+    }
+    if (this.verbose && typeof console !== "undefined") {
+      const method = level === "error" ? "error" : level === "warn" ? "warn" : "log";
+      // eslint-disable-next-line no-console
+      console[method](
+        `[app-launcher] ${level.toUpperCase()} ${category}: ${message}`,
+        payload ?? ""
+      );
+    }
+  }
+
+  // ---------------------------------------------------------------- check security
+
+  _verifySecurity(macho, path) {
+    if (!this.security) return { ok: true, reason: "no-security" };
+
+    // Code signing
+    if (typeof this.security.codeSigning?.verify === "function") {
+      try {
+        const result = this.security.codeSigning.verify(macho, { path });
+        if (!result?.valid) {
+          kernelBus.emit("sec:codesign-failed", {
+            path,
+            reason: result?.reason ?? "invalid-signature",
+          });
+          return { ok: false, reason: "codesign-failed" };
+        }
+      } catch (err) {
+        kernelBus.emit("sec:codesign-failed", {
+          path,
+          reason: String(err),
+        });
+        return { ok: false, reason: "codesign-error" };
+      }
+    }
+
+    // Gatekeeper
+    if (typeof this.security.gatekeeper?.assess === "function") {
+      try {
+        const result = this.security.gatekeeper.assess({ path });
+        if (!result?.allowed) {
+          kernelBus.emit("sec:gatekeeper-blocked", { path, reason: result?.reason });
+          return { ok: false, reason: "gatekeeper-blocked" };
+        }
+      } catch (err) {
+        kernelBus.emit("sec:gatekeeper-blocked", {
+          path,
+          reason: String(err),
+        });
+        return { ok: false, reason: "gatekeeper-error" };
+      }
+    }
+
+    return { ok: true, reason: "allowed" };
+  }
+
+  // ---------------------------------------------------------------- load frameworks
+
+  _resolveDylibPath(installName) {
+    // Install names tipo "@rpath/Foundation.framework/Foundation"
+    // o rutas absolutas "/usr/lib/libSystem.B.dylib"
+    const clean = installName
+      .replace(/^@rpath\//, "")
+      .replace(/^@loader_path\//, "")
+      .replace(/^@executable_path\//, "");
+
+    // ¿Es uno de los frameworks conocidos?
+    for (const [shortName, fullPath] of Object.entries(SYSTEM_FRAMEWORKS)) {
+      if (
+        clean === shortName ||
+        clean === `${shortName}.framework/${shortName}` ||
+        clean.includes(`${shortName}.framework/`)
+      ) {
+        return { shortName, path: fullPath };
+      }
+    }
+
+    // Librerías de /usr/lib
+    if (clean.startsWith("lib") || installName.startsWith("/usr/lib/")) {
+      return { shortName: clean, path: `/usr/lib/${clean}` };
+    }
+
+    // Fallback: usar el nombre tal cual
+    return { shortName: clean, path: clean };
+  }
+
+  _loadFrameworkForDylib(installName, process) {
+    const { shortName, path } = this._resolveDylibPath(installName);
+
+    if (this._loadedFrameworks.has(shortName)) {
+      process.frameworks.add(shortName);
+      return { ok: true, cached: true, shortName, path };
+    }
+
+    kernelBus.emit("dylib:will-load", {
+      pid: process.pid,
+      installName,
+      resolved: path,
+      shortName,
+    });
+
+    try {
+      // Cada framework tiene un "loader" que expone sus símbolos al dyld.
+      // Aquí solo emitimos el evento; el dyld ya resolvió la tabla de símbolos.
+      this._loadedFrameworks.add(shortName);
+      process.frameworks.add(shortName);
+
+      kernelBus.emit("dylib:did-load", {
+        pid: process.pid,
+        installName,
+        resolved: path,
+        shortName,
+        at: now(),
+      });
+
+      return { ok: true, cached: false, shortName, path };
+    } catch (err) {
+      kernelBus.emit("dylib:load-failed", {
+        pid: process.pid,
+        installName,
+        resolved: path,
+        shortName,
+        error: String(err),
+      });
+      return { ok: false, error: String(err), shortName, path };
+    }
+  }
+
+  // ---------------------------------------------------------------- build initial stack
+
+  _buildInitialStack({ argv, envp, argc, entryPoint, stackSize = 8 * 1024 * 1024 }) {
+    // Layout real (simplificado) del stack inicial en Darwin:
+    //
+    //   [high addresses]
+    //     auxv[]              (AT_EXECFN, AT_ENTRY, AT_PAGESZ, ...)
+    //     NULL
+    //     envp[]
+    //     NULL
+    //     argv[]
+    //     argc                ← sp apunta aquí
+    //   [low addresses]
+    //
+    // En nuestro emulador, generamos un objeto que el VCPU-executor puede
+    // leer como si fuera el stack inicial. No reservamos memoria real.
+
+    const auxv = [
+      { key: "AT_EXECFN", value: 0 },
+      { key: "AT_ENTRY",  value: entryPoint ?? 0 },
+      { key: "AT_PAGESZ", value: 4096 },
+      { key: "AT_PHDR",   value: 0 },
+      { key: "AT_PHNUM",  value: 0 },
+      { key: "AT_BASE",   value: 0 },
+      { key: "AT_FLAGS",  value: 0 },
+      { key: "AT_HWCAP",  value: 0 },
+      { key: "AT_CLKTCK", value: 100 },
+      { key: "AT_RANDOM", value: 0 },
+      { key: "AT_NULL",   value: 0 },
+    ];
+
+    return {
+      kind: "initial-stack",
+      size: stackSize,
+      sp: stackSize - 64,          // puntero de pila inicial (top - red zone)
+      argc,
+      argv: [...argv],
+      envp: { ...envp },
+      auxv,
+      // offsets de strings en el stack (para que el executor los resuelva)
+      strings: {
+        argv: argv.map((s) => ({ offset: 0, value: s })),
+        envp: Object.entries(envp).map(([k, v]) => ({
+          offset: 0,
+          value: `${k}=${v}`,
+        })),
+      },
+    };
+  }
+
+  // ---------------------------------------------------------------- find entry point
+
+  _findEntryPoint(macho) {
+    const loads = macho?.loadCommands ?? [];
+
+    // 1. LC_MAIN (formato moderno)
+    for (const lc of loads) {
+      if (lc.cmd === LC_MAIN) {
+        return {
+          kind: "LC_MAIN",
+          entryOffset: lc.entryoff ?? 0,
+          stackSize: lc.stacksize ?? 0,
+        };
+      }
+    }
+
+    // 2. LC_UNIXTHREAD (formato antiguo)
+    for (const lc of loads) {
+      if (lc.cmd === LC_UNIXTHREAD) {
+        return {
+          kind: "LC_UNIXTHREAD",
+          pc: lc.pc ?? 0,
+          sp: lc.sp ?? 0,
+          registers: lc.registers ?? {},
+        };
+      }
+    }
+
+    // 3. Fallback: buscar símbolo `_main` en la tabla de símbolos
+    const mainSym =
+      macho?.symbols?.find?.((s) => s.name === "_main") ??
+      macho?.exports?.find?.((s) => s.name === "_main");
+
+    if (mainSym) {
+      return {
+        kind: "symbol",
+        name: "_main",
+        address: mainSym.address ?? mainSym.value ?? 0,
+      };
+    }
+
+    // 4. Nada encontrado
+    return { kind: "none" };
+  }
+
+  // ---------------------------------------------------------------- create task
+
+  _createTask({ path, macho }) {
+    return {
+      taskId: `${path}#${now()}`,
+      vmRegions: new Map(),
+      ports: new Map(),
+      memoryUsed: 0,
+      createdAt: now(),
+      cpuType: macho?.header?.cputype ?? CPU_TYPE_ARM64,
+      cpuSubtype: macho?.header?.cpusubtype ?? 0,
+    };
+  }
+
+  // ---------------------------------------------------------------- LAUNCH (público)
+
+  /**
+   * Ejecuta un binario Mach-O.
+   *
+   * @param {object} opts
+   * @param {string}   opts.path        Ruta del binario (para logs/deduplicación)
+   * @param {Uint8Array|object} opts.binary  Bytes o Mach-O ya parseado
+   * @param {string[]} [opts.argv]      Argumentos (sin contar argv[0])
+   * @param {object}   [opts.envp]      Variables de entorno
+   * @param {string}   [opts.cwd]       Working directory
+   * @param {boolean}  [opts.wait]      Si true, espera a que termine (sync)
+   * @param {boolean}  [opts.dryRun]    Si true, no ejecuta, solo valida
+   *
+   * @returns {AppProcess}
+   */
+  launch({
+    path,
+    binary,
+    argv = [],
+    envp = {},
+    cwd = "/",
+    wait = false,
+    dryRun = false,
+    uid = 501,          // usuario por defecto
+    gid = 20,
+  } = {}) {
+    const t0 = now();
+    this._stats.launches++;
+
+    // ---------------------------------------------------------- validación básica
+    if (!path) {
+      this._stats.failures++;
+      const err = new Error("launch: falta `path`");
+      this._log("error", "launch", err.message);
+      throw err;
+    }
+
+    // ---------------------------------------------------------- parseo Mach-O
+    let macho;
+    try {
+      if (binary instanceof Uint8Array || binary instanceof ArrayBuffer) {
+        const bytes =
+          binary instanceof Uint8Array ? binary : new Uint8Array(binary);
+        const parser = new MachOParser(bytes, { path });
+        macho = parser.parse();
+      } else if (binary && typeof binary === "object") {
+        macho = binary;
+      } else {
+        throw new Error("binary debe ser Uint8Array/ArrayBuffer/Mach-O ya parseado");
+      }
+    } catch (err) {
+      this._stats.failures++;
+      this._log("error", "parse", `Mach-O inválido: ${err.message}`, { path });
+      kernelBus.emit("process:launch-failed", {
+        path,
+        stage: "parse",
+        error: String(err),
+      });
+      throw err;
+    }
+
+    // ---------------------------------------------------------- verificar tipo
+    const fileType = macho?.header?.filetype;
+    if (
+      fileType !== MH_EXECUTE &&
+      fileType !== MH_DYLIB &&
+      fileType !== MH_BUNDLE
+    ) {
+      this._stats.failures++;
+      const msg = `Tipo Mach-O no ejecutable: ${fileType}`;
+      this._log("error", "launch", msg, { path, fileType });
+      kernelBus.emit("process:launch-failed", {
+        path,
+        stage: "filetype",
+        error: msg,
+      });
+      throw new Error(msg);
+    }
+
+    // ---------------------------------------------------------- seguridad
+    const secCheck = this._verifySecurity(macho, path);
+    if (!secCheck.ok) {
+      this._stats.failures++;
+      this._log("warn", "security", `Launch bloqueado: ${secCheck.reason}`, { path });
+      kernelBus.emit("process:launch-failed", {
+        path,
+        stage: "security",
+        error: secCheck.reason,
+      });
+      throw new Error(`Seguridad: ${secCheck.reason}`);
+    }
+
+    // ---------------------------------------------------------- task virtual
+    const task = this._createTask({ path, macho });
+
+    // ---------------------------------------------------------- proceso
+    const fullArgv = [path, ...argv];
+    const proc = new AppProcess({
+      path,
+      argv: fullArgv,
+      envp: {
+        PATH: "/usr/bin:/bin:/usr/sbin:/sbin",
+        HOME: "/Users/rain",
+        USER: "rain",
+        SHELL: "/bin/zsh",
+        TMPDIR: "/tmp",
+        LANG: "es_ES.UTF-8",
+        TERM: "xterm-256color",
+        PWD: cwd,
+        RAINOS: "1",
+        ...envp,
+      },
+      task,
+      macho,
+      dyld: null,
+      objc: null,
+      swift: null,
+    });
+
+    this.processes.set(proc.pid, proc);
+    proc.setState(PROC_STATE.LOADING);
+
+    kernelBus.emit("process:spawned", {
+      pid: proc.pid,
+      path,
+      argv: fullArgv,
+      uid,
+      gid,
+    });
+
+    this._log("info", "launch", `Spawn pid=${proc.pid} ${path}`, {
+      pid: proc.pid,
+      argv: fullArgv,
+    });
+
+    // ---------------------------------------------------------- dry run
+    if (dryRun) {
+      proc.setState(PROC_STATE.READY);
+      return proc;
+    }
+
+    // ---------------------------------------------------------- dyld
+    let dyld;
+    try {
+      dyld = new DyldLoader({
+        macho,
+        path,
+        envp: proc.envp,
+        security: this.security,
+      });
+      dyld.load();
+
+      const dylibs =
+        macho?.loadCommands
+          ?.filter?.((lc) =>
+            lc.cmd === LC_LOAD_DYLIB ||
+            lc.cmd === LC_LOAD_WEAK_DYLIB ||
+            lc.cmd === LC_REEXPORT_DYLIB
+          )
+          ?.map?.((lc) => lc.name)
+          ?.filter?.(Boolean) ?? [];
+
+      for (const installName of dylibs) {
+        const r = this._loadFrameworkForDylib(installName, proc);
+        if (!r.ok) {
+          this._log(
+            "warn",
+            "dylib",
+            `No se pudo cargar ${installName} (continuando)`,
+            { pid: proc.pid, installName }
+          );
+        }
+      }
+
+      proc.dyld = dyld;
+      proc.setState(PROC_STATE.LINKING);
+    } catch (err) {
+      this._stats.failures++;
+      proc.crash(`dyld: ${err.message}`);
+      this._log("error", "dyld", `Fallo en dyld: ${err.message}`, {
+        pid: proc.pid,
+      });
+      throw err;
+    }
+
+    // ---------------------------------------------------------- ObjC
+    try {
+      const objc = new ObjCRuntime({ macho, dyld, process: proc });
+      objc.initialize?.();
+      proc.objc = objc;
+    } catch (err) {
+      this._log("warn", "objc", `Runtime ObjC falló: ${err.message}`, {
+        pid: proc.pid,
+      });
+    }
+
+    // ---------------------------------------------------------- Swift
+    try {
+      const swift = new SwiftRuntime({ macho, dyld, process: proc });
+      swift.initialize?.();
+      proc.swift = swift;
+    } catch (err) {
+      this._log("warn", "swift", `Runtime Swift falló: ${err.message}`, {
+        pid: proc.pid,
+      });
+    }
+
+    // ---------------------------------------------------------- LibSystem + CF
+    try {
+      const libsystem = new LibSystem({ process: proc, dyld });
+      libsystem.install?.();
+      const cf = new CoreFoundation({ process: proc, dyld });
+      cf.install?.();
+    } catch (err) {
+      this._log("warn", "libsystem", `LibSystem falló: ${err.message}`, {
+        pid: proc.pid,
+      });
+    }
+
+    // ---------------------------------------------------------- stack inicial
+    const entry = this._findEntryPoint(macho);
+    if (entry.kind === "none") {
+      this._stats.failures++;
+      proc.crash("entry-point-missing");
+      const msg = "No se encontró entry point (LC_MAIN/LC_UNIXTHREAD/_main)";
+      this._log("error", "launch", msg, { pid: proc.pid });
+      throw new Error(msg);
+    }
+
+    proc.initialStack = this._buildInitialStack({
+      argv: fullArgv,
+      envp: proc.envp,
+      argc: fullArgv.length,
+      entryPoint: entry.entryOffset ?? entry.address ?? entry.pc ?? 0,
+    });
+
+    proc.entry = entry;
+
+    kernelBus.emit("process:entry-resolved", {
+      pid: proc.pid,
+      path,
+      entry,
+    });
+
+    // ---------------------------------------------------------- main thread
+    proc.mainThread = proc.spawnThread({
+      name: "main",
+      entry,
+      detached: false,
+    });
+
+    // ---------------------------------------------------------- RUNNING
+    proc.setState(PROC_STATE.RUNNING);
+
+    // ---------------------------------------------------------- ejecución real
+    try {
+      this._execute(proc, entry);
+    } catch (err) {
+      proc.crash(String(err));
+      this._stats.crashes++;
+      this._log("error", "exec", `Crash en ejecución: ${err.message}`, {
+        pid: proc.pid,
+      });
+      throw err;
+    }
+
+    // ---------------------------------------------------------- finalización
+    const runtimeMs = now() - t0;
+    this._stats.totalRuntimeMs += runtimeMs;
+
+    if (proc.state === PROC_STATE.CRASHED) {
+      this._stats.crashes++;
+    } else {
+      this._stats.successes++;
+    }
+
+    this._log(
+      "info",
+      "launch",
+      `Proceso pid=${proc.pid} terminado en ${runtimeMs.toFixed(1)}ms (code=${proc.exitCode ?? "sig:" + proc.exitSignal})`,
+      { pid: proc.pid, runtimeMs }
+    );
+
+    return proc;
+  }
+
+  // ---------------------------------------------------------------- execute entry
+
+  /**
+   * Ejecuta el entry point del binario. En este SO virtual:
+   *   1. Emite el evento `process:will-execute`.
+   *   2. Llama al `entryFn` si el macho expone un entry point ejecutable
+   *      (por ejemplo, un script embebido en un bundle de rainOS).
+   *   3. Si no hay entryFn, simula la ejecución: marca el proceso como EXITED
+   *      con código 0. Esto cubre el caso de que solo queramos validar el boot
+   *      del binario sin tener un VCPU real detrás.
+   *   4. Emite `process:did-execute` (o `process:crashed`).
+   */
+  _execute(proc, entry) {
+    kernelBus.emit("process:will-execute", {
+      pid: proc.pid,
+      path: proc.path,
+      entry,
+    });
+
+    // Un binario Mach-O puede traer un "entryFn" adjunto (bundle nativo de
+    // rainOS). Lo respetamos.
+    const entryFn = proc.macho?.entryFn ?? null;
+    if (typeof entryFn === "function") {
+      const result = entryFn({
+        pid: proc.pid,
+        argv: proc.argv,
+        envp: proc.envp,
+        task: proc.task,
+        process: proc,
+      });
+      const code =
+        typeof result === "number" ? result : result?.code ?? EXIT_SUCCESS;
+      proc.exit(code);
+    } else {
+      // No hay entry nativo: simulamos terminación limpia.
+      proc.exit(EXIT_SUCCESS);
+    }
+
+    kernelBus.emit("process:did-execute", {
+      pid: proc.pid,
+      path: proc.path,
+      exitCode: proc.exitCode,
+      exitSignal: proc.exitSignal,
+      runtimeMs: proc.startedAt ? now() - proc.startedAt : 0,
+    });
+  }
+
+  // ---------------------------------------------------------------- management
+
+  listProcesses() {
+    return [...this.processes.values()].map((p) => p.toJSON());
+  }
+
+  getProcess(pid) {
+    return this.processes.get(pid) ?? null;
+  }
+
+  killProcess(pid, signal = 9) {
+    const p = this.processes.get(pid);
+    if (!p) return false;
+    p.kill(signal);
+    return true;
+  }
+
+  reap() {
+    // Limpia procesos zombis/exited
+    let reaped = 0;
+    for (const [pid, p] of [...this.processes.entries()]) {
+      if (
+        p.state === PROC_STATE.EXITED ||
+        p.state === PROC_STATE.CRASHED ||
+        p.state === PROC_STATE.ZOMBIE
+      ) {
+        this.processes.delete(pid);
+        reaped++;
+      }
+    }
+    return reaped;
+  }
+
+  stats() {
+    return { ...this._stats };
+  }
+
+  reset() {
+    this.processes.clear();
+    this._loadedFrameworks.clear();
+    this._stats = {
+      launches: 0,
+      successes: 0,
+      failures: 0,
+      crashes: 0,
+      totalRuntimeMs: 0,
+    };
+  }
 }
 
-export default {
-  AppLauncher,
-  AppBundle,
-  PlistParser,
-  connectGuiOutput,
-  LAUNCHER_EVENTS,
-};
+// ============================================================================
+// PROVIDER REACT
+// ============================================================================
+
+const AppLauncherContext = createContext(null);
+
+export function AppLauncherProvider({
+  children,
+  security = null,
+  syslogs = null,
+  verbose = false,
+  autoReap = true,
+  reapEveryMs = 60_000,
+}) {
+  const launcherRef = useRef(null);
+
+  if (!launcherRef.current) {
+    launcherRef.current = new AppLauncher({ security, syslogs, verbose });
+  }
+
+  const launcher = launcherRef.current;
+
+  // Reap periódico de procesos terminados
+  useEffect(() => {
+    if (!autoReap) return;
+    const t = setInterval(() => {
+      try {
+        const reaped = launcher.reap();
+        if (reaped > 0) {
+          kernelBus.emit("process:reaped", { count: reaped });
+        }
+      } catch (_) {}
+    }, reapEveryMs);
+    return () => clearInterval(t);
+  }, [launcher, autoReap, reapEveryMs]);
+
+  // Log de montaje
+  useEffect(() => {
+    kernelBus.emit("app-launcher:ready", { verbose });
+    if (typeof syslogs?.info === "function") {
+      syslogs.info(
+        "com.rainos.app-launcher",
+        "lifecycle",
+        "AppLauncher listo",
+        { verbose }
+      );
+    }
+  }, [launcher, syslogs, verbose]);
+
+  const value = useMemo(() => {
+    return {
+      launcher,
+      launch: (opts) => launcher.launch(opts),
+      listProcesses: () => launcher.listProcesses(),
+      getProcess: (pid) => launcher.getProcess(pid),
+      killProcess: (pid, sig) => launcher.killProcess(pid, sig),
+      reap: () => launcher.reap(),
+      stats: () => launcher.stats(),
+      reset: () => launcher.reset(),
+    };
+  }, [launcher]);
+
+  return (
+    <AppLauncherContext.Provider value={value}>
+      {children}
+    </AppLauncherContext.Provider>
+  );
+}
+
+export function useAppLauncher() {
+  const ctx = useContext(AppLauncherContext);
+  if (!ctx) {
+    throw new Error(
+      "useAppLauncher must be used within AppLauncherProvider"
+    );
+  }
+  return ctx;
+}
+
+// ============================================================================
+// EXPORTS AUXILIARES
+// ============================================================================
+
+export { PROC_STATE, EXIT_SUCCESS, EXIT_FAILURE, EXIT_CRASHED, EXIT_KILLED };
+export { SYSTEM_FRAMEWORKS, MH_EXECUTE, MH_DYLIB, MH_BUNDLE, LC_MAIN, LC_UNIXTHREAD };
+export { readCString, writeCString, hex };
