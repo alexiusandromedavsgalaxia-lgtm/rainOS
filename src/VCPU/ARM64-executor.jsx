@@ -449,7 +449,7 @@ export class ARM64Executor {
         return 0;
       }
     }
-    return this.memory[a & 0xfffff] ?? 0;
+    return this.memory[a & 0xffffff] ?? 0;
   }
 
   writeByte(addr, value) {
@@ -464,7 +464,7 @@ export class ARM64Executor {
         return;
       }
     }
-    this.memory[a & 0xfffff] = value & 0xff;
+    this.memory[a & 0xffffff] = value & 0xff;
   }
 
   readU16(addr) {
