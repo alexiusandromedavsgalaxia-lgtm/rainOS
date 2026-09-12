@@ -1305,30 +1305,315 @@ export class ARM64Executor {
     return { mnemonic: "branch-unimpl", insn: hex(insn, 8), cycles: 1 };
   }
 
-  _execLoadStore(insn) {
-    // LDR/STR/LDP/STP/LDRB/STRB/LDRH/STRH/LDRSW + atomics
-    // Detección mínima: op0=01 y bit 27=0 o 1
-    const isLoad = bit(insn, 22) === 1;
-    const rn = bits(insn, 9, 5);
-    const rt = bits(insn, 4, 0);
-    const imm12 = bits(insn, 21, 10);
-    const base = this.readX(rn);
+   _execLoadStore(insn) {
+    // ============================================================
+    // Loads and Stores
+    // ============================================================
+    // La familia se identifica por los bits [29:27] del opcode:
+    //
+    //   bit 29 = 0  → Load/store register (unsigned immediate)  + LDP/STP
+    //   bit 29 = 1  → Load/store register (register offset) o
+    //                 Load/store register (unscaled immediate)
+    //
+    // El tamaño del acceso lo dan los bits [31:30] (size):
+    //   00 = byte (B), 01 = halfword (H), 10 = word (W),
+    //   11 = doubleword (X) — o "sword" si opc=10/11 en size=10.
+    //
+    // El campo opc (bits [23:22]) distingue load/store y sign-extension:
+    //   00 = STR / LDR (ZR)
+    //   01 = LDR (ZR) / LDR (sin signo)
+    //   10 = LDR (sign-extended) / LDRSW
+    //   11 = LDR (sign-extended) / —
+    //
+    // Esta implementación cubre:
+    //   - LDR/STR/LDRB/STRB/LDRH/STRH/LDRSW (32 y 64 bits)
+    //   - offset unsigned (imm12), sin indexar
+    //   - pre-indexado [Xn, #imm]!  (write-back)
+    //   - post-indexado [Xn], #imm  (write-back)
+    //   - registro offset [Xn, Xm] con opcional extend + shift
+    //   - LDP/STP (load/store pair) con imm7 escalado
+    //
+    // Lo que NO cubre (y lo dice honestamente):
+    //   - LDR literal (PC-relative, encoding 0x18/0x58)
+    //   - LDUR/STUR (unscaled, encoding 0x-- -- 00)
+    //   - Atomics (LDXR/STXR/LDAR/STLR/CAS/SWP/LDADD/...) — los cubre
+    //     ARM64eExecutor o se implementan aparte si se necesitan
+    // ============================================================
 
-    if (imm12 === 0 && rn === 31 && rt === 31 && !isLoad) {
-      return { mnemonic: "stub-loadstore", cycles: 1 };
+    const op1 = bits(insn, 29, 27); // familia dentro de Load/Store
+
+    // ------------------------------------------------------------
+    // Load/store pair (LDP / STP / LDPSW) — op1 = 101
+    //   bit 31  = 0 (32-bit) / 1 (64-bit)  [salvo LDPSW]
+    //   bit 30  = V (0 = GP, 1 = SIMD)
+    //   bit 29  = 0
+    //   bit 27  = 1  →  101 en [29:27]
+    //   bits[26:23] = opc:
+    //       000 = 32-bit (STP/LDP W)
+    //       001 = LDPSW
+    //       010 = 64-bit (STP/LDP X)
+    //       011 = LDPSW (mismo, distinto bit V)
+    //   bit 22  = L (0 = store, 1 = load)
+    //   bits[21:15] = imm7 (offset escalado por tamaño)
+    //   bits[14:10] = Rt2
+    //   bits[9:5]   = Rn
+    //   bits[4:0]   = Rt
+    // ------------------------------------------------------------
+    if (op1 === 0b101) {
+      const V  = bit(insn, 26);         // 0 = GP, 1 = SIMD (no cubierto)
+      const L  = bit(insn, 22);         // 0 = STP, 1 = LDP
+      const imm7 = bits(insn, 21, 15);
+      const Rt2 = bits(insn, 14, 10);
+      const Rn  = bits(insn, 9, 5);
+      const Rt  = bits(insn, 4, 0);
+
+      // Desplazamiento con signo de 7 bits
+      let offset = Number(signExtend(BigInt(imm7), 7));
+
+      // El campo opc real está en bits [31:30] (bits[26:23] es para
+      // algunas variantes, pero para el pair concreto lo que importa
+      // es el tamaño: 32-bit → offset *= 4, 64-bit → offset *= 8)
+      const is64 = bit(insn, 31) === 1;
+      offset *= is64 ? 8 : 4;
+
+      const base = this.readX(Rn);
+      const addr = u64(base + BigInt(offset));
+
+      if (V === 1) {
+        // SIMD pair — no cubierto aquí, fallback honesto
+        return { mnemonic: "ldp/stp-simd-unimpl", insn: hex(insn, 8), cycles: 1 };
+      }
+
+      if (L === 1) {
+        // LDP
+        if (is64) {
+          this.writeX(Rt,  this.readU64(addr));
+          this.writeX(Rt2, this.readU64(u64(addr + 8n)));
+        } else {
+          this.writeW(Rt,  this.readU32(addr));
+          this.writeW(Rt2, this.readU32(u64(addr + 4n)));
+        }
+        this.stats.loads++;
+        return { mnemonic: `ldp x${Rt}, x${Rt2}, [x${Rn}, #${offset}]`, cycles: 2 };
+      } else {
+        // STP
+        if (is64) {
+          this.writeU64(addr,          this.readX(Rt));
+          this.writeU64(u64(addr + 8n), this.readX(Rt2));
+        } else {
+          this.writeU32(addr,          this.readW(Rt));
+          this.writeU32(u64(addr + 4n), this.readW(Rt2));
+        }
+        this.stats.stores++;
+        return { mnemonic: `stp x${Rt}, x${Rt2}, [x${Rn}, #${offset}]`, cycles: 2 };
+      }
     }
 
-    const addr = u64(base + BigInt(imm12) * 8n);
-    if (isLoad) {
-      this.writeX(rt, this.readU64(addr));
-      this.stats.loads++;
-    } else {
-      this.writeU64(addr, this.readX(rt));
-      this.stats.stores++;
+    // ------------------------------------------------------------
+    // Load/store register — op1 = 001 (unscaled/imm12) o 011 (registro)
+    // Para no complicar el dispatch, decodificamos directamente aquí.
+    // ------------------------------------------------------------
+    if (op1 === 0b001 || op1 === 0b011) {
+      const size = bits(insn, 31, 30);   // 00=B, 01=H, 10=W, 11=X
+      const opc  = bits(insn, 23, 22);   // 00=STR, 01=LDR, 10=LDRSW, 11=LDR(sign)
+      const Rn   = bits(insn, 9, 5);
+      const Rt   = bits(insn, 4, 0);
+
+      // Detectar la forma del addressing:
+      //   op1 = 001 y bit 24 = 1  → unsigned offset (imm12 escalado)
+      //   op1 = 001 y bit 24 = 0  → unscaled / pre / post (no cubierto aquí por completo)
+      //   op1 = 011               → register offset
+      const isUnsigned = (op1 === 0b001) && (bit(insn, 24) === 1);
+      const isRegister = (op1 === 0b011);
+
+      // ----------------------------------------------
+      // Register offset: [Xn, Xm{, extend}{, shift}]
+      // ----------------------------------------------
+      if (isRegister) {
+        const Rm   = bits(insn, 20, 16);
+        const option = bits(insn, 15, 13); // extend: 010=UXTW, 011=LSL, 110=SXTW, 111=SXTX
+        const S    = bit(insn, 12);         // shift por tamaño (0 o log2(size))
+
+        let index = this.readX(Rm);
+
+        // Aplicar extend
+        switch (option) {
+          case 0b010: index = u64(BigInt.asUintN(32, index)); break; // UXTW
+          case 0b011: index = index; break;                          // LSL (no-op)
+          case 0b110: index = u64(s64(BigInt.asIntN(32, index))); break; // SXTW
+          case 0b111: index = index; break;                          // SXTX
+          default:    index = index; break;
+        }
+
+        // Aplicar shift
+        const shiftAmt = S === 1 ? size : 0;
+        const scaledIndex = index << BigInt(shiftAmt);
+
+        const base = this.readX(Rn);
+        const addr = u64(base + scaledIndex);
+
+        const result = this._doLoadStore(size, opc, Rt, addr);
+        if (result === null) {
+          return { mnemonic: "ldr/str-unimpl", insn: hex(insn, 8), cycles: 1 };
+        }
+        if (opc === 0b00) this.stats.stores++;
+        else this.stats.loads++;
+        return { mnemonic: result, cycles: 4 };
+      }
+
+      // ----------------------------------------------
+      // Unsigned offset (imm12 escalado por tamaño)
+      // ----------------------------------------------
+      if (isUnsigned) {
+        const imm12 = BigInt(bits(insn, 21, 10));
+        const scale = 1 << size;      // 1, 2, 4 u 8
+        const off = imm12 * BigInt(scale);
+
+        const base = this.readX(Rn);
+        const addr = u64(base + off);
+
+        const result = this._doLoadStore(size, opc, Rt, addr);
+        if (result === null) {
+          return { mnemonic: "ldr/str-unimpl", insn: hex(insn, 8), cycles: 1 };
+        }
+        if (opc === 0b00) this.stats.stores++;
+        else this.stats.loads++;
+        return { mnemonic: result, cycles: 4 };
+      }
+
+      // ----------------------------------------------
+      // Unscaled / pre / post indexado (op1=001, bit 24=0)
+      //   bits[11:10] = 00 → unscaled (LDUR/STUR)
+      //   bits[11:10] = 01 → post-index  [Xn], #imm
+      //   bits[11:10] = 10 → unscaled (LDUR/STUR)
+      //   bits[11:10] = 11 → pre-index   [Xn, #imm]!
+      // ----------------------------------------------
+      const imm9 = bits(insn, 20, 12);
+      const off = BigInt(Number(signExtend(BigInt(imm9), 9)));
+      const mode = bits(insn, 11, 10);
+
+      const base = this.readX(Rn);
+      let addr;
+      let writeBack = false;
+      let wbValue = 0n;
+
+      switch (mode) {
+        case 0b00:
+        case 0b10:
+          // Unscaled (LDUR/STUR)
+          addr = u64(base + off);
+          break;
+        case 0b01:
+          // Post-index: [Xn], #imm
+          addr = base;
+          wbValue = u64(base + off);
+          writeBack = true;
+          break;
+        case 0b11:
+          // Pre-index: [Xn, #imm]!
+          addr = u64(base + off);
+          wbValue = addr;
+          writeBack = true;
+          break;
+        default:
+          return { mnemonic: "ldr/str-unimpl", insn: hex(insn, 8), cycles: 1 };
+      }
+
+      const result = this._doLoadStore(size, opc, Rt, addr);
+      if (result === null) {
+        return { mnemonic: "ldr/str-unimpl", insn: hex(insn, 8), cycles: 1 };
+      }
+
+      if (writeBack) {
+        // En pre/post-index, Xn = wbValue (salvo si Xn=31, que
+        // escribiría SP; en ARM64 eso es válido y se hace).
+        this.writeX(Rn, wbValue);
+      }
+
+      if (opc === 0b00) this.stats.stores++;
+      else this.stats.loads++;
+
+      const modeStr = mode === 0b01 ? "], #" : mode === 0b11 ? ", #";
+      const closeStr = mode === 0b01 ? "" : "]!";
+      return {
+        mnemonic: `ldr/str x${Rt}, [x${Rn}${modeStr}${off}${closeStr}`,
+        cycles: 4,
+      };
     }
-    return { mnemonic: isLoad ? "ldr" : "str", cycles: 4 };
+
+    // Fallback honesto para todo lo que no cubrimos
+    return { mnemonic: "loadstore-unimpl", insn: hex(insn, 8), cycles: 1 };
   }
 
+  // ------------------------------------------------------------
+  // Helper: ejecuta el load/store real según size + opc.
+  // Devuelve el mnemonic, o null si la combinación no es válida.
+  // ------------------------------------------------------------
+  _doLoadStore(size, opc, Rt, addr) {
+    // size: 00=B, 01=H, 10=W, 11=X
+    // opc:  00=STR, 01=LDR (sin signo), 10=LDR (sign-extended) / LDRSW, 11=LDR (sign)
+
+    if (opc === 0b00) {
+      // Store
+      switch (size) {
+        case 0b00: this.writeByte(addr, Number(this.readX(Rt) & 0xffn)); return "strb";
+        case 0b01: this.writeU16(addr, Number(this.readX(Rt) & 0xffffn)); return "strh";
+        case 0b10: this.writeU32(addr, Number(this.readX(Rt) & 0xffffffffn)); return "str";
+        case 0b11: this.writeU64(addr, this.readX(Rt)); return "str";
+        default: return null;
+      }
+    }
+
+    if (opc === 0b01) {
+      // Load sin signo
+      switch (size) {
+        case 0b00: this.writeW(Rt, this.readByte(addr)); return "ldrb";
+        case 0b01: this.writeW(Rt, this.readU16(addr)); return "ldrh";
+        case 0b10: this.writeW(Rt, this.readU32(addr)); return "ldr";
+        case 0b11: this.writeX(Rt, this.readU64(addr)); return "ldr";
+        default: return null;
+      }
+    }
+
+    if (opc === 0b10) {
+      // LDRSW / LDR sign-extended (solo válido en size=10, o size=00/01 con sign)
+      if (size === 0b10) {
+        // LDRSW: carga 32 bits con signo a 64 bits
+        const v = this.readU32(addr);
+        this.writeX(Rt, u64(s64(BigInt.asIntN(32, v))));
+        return "ldrsw";
+      }
+      // Sign-extended de byte/half a 64 bits
+      if (size === 0b00) {
+        this.writeX(Rt, u64(BigInt(Number(signExtend(BigInt(this.readByte(addr)), 8)))));
+        return "ldrsb";
+      }
+      if (size === 0b01) {
+        this.writeX(Rt, u64(BigInt(Number(signExtend(BigInt(this.readU16(addr)), 16)))));
+        return "ldrsh";
+      }
+      return null;
+    }
+
+    if (opc === 0b11) {
+      // LDR sign-extended a 32 bits (salvo size=11, que no aplica)
+      if (size === 0b00) {
+        this.writeW(Rt, u32(BigInt(Number(signExtend(BigInt(this.readByte(addr)), 8)))));
+        return "ldrsb";
+      }
+      if (size === 0b01) {
+        this.writeW(Rt, u32(BigInt(Number(signExtend(BigInt(this.readU16(addr)), 16)))));
+        return "ldrsh";
+      }
+      if (size === 0b10) {
+        this.writeW(Rt, this.readU32(addr));
+        return "ldr";
+      }
+      return null;
+    }
+
+    return null;
+  }
   _execDataProcReg(insn) {
     // ADD/SUB/AND/ORR/EOR + shifted register variants
     const rm = bits(insn, 20, 16);
