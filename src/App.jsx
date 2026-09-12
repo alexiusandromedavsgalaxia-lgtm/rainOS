@@ -1,4 +1,471 @@
+// ============================================================================
+// App.jsx — Raíz de rainOS
+// ----------------------------------------------------------------------------
+// Monta TODO el sistema operativo. Este es el árbol de providers definitivo:
+//
+//   Bootstrap → WindowManager → SafeBoot → BootLoader → Scheduler
+//   → Updater → Toast → AppInstaller → DMGInstaller
+//   → StartupInstaller → InitialConfig → LockScreen
+//   → BootGate
+//       → SecurityProvider
+//       → SyslogsProvider
+//       → SyscallsProvider
+//       → SysfilteredProvider
+//       → BatteryProvider
+//       → ChargeSystemProvider
+//       → DriversProvider
+//       → DisplayProvider
+//       → AudioProvider
+//       → NetworkProvider
+//       → UsbProvider
+//       → BluetoothProvider
+//       → CameraProvider
+//       → ThermalProvider
+//       → DiagnoseProvider
+//       → BatteryDiagnosticProvider
+//       → SystemBridge
+//       → RuntimeProvider
+//       → Shell
+// ============================================================================
 
+import React, { useEffect, useMemo, useContext, useRef, useState } from "react";
+
+import { kernelBus } from "./kernel/kernel.jsx";
+
+// ─────────────── Kernel / cadena de arranque ───────────────
+import { WindowManagerProvider, useWindowManager } from "./kernel/kernel.jsx";
+import { BootstrapProvider } from "./bootstrap/bootstrap.jsx";
+import { BootLoaderProvider } from "./bootloader/bootloader.jsx";
+import { SafeBootProvider } from "./safeboot/safeboot.jsx";
+import { SchedulerProvider } from "./scheduler/scheduler.jsx";
+
+// ─────────────── Instaladores y sistema ───────────────
+import { StartupInstallerProvider } from "./startupinstaller/startupinstaller.jsx";
+import { InitialConfigProvider } from "./initialconfig/initialconfig.jsx";
+import { ConnectedInitSystem } from "./initsystem/initsystem.jsx";
+import { UpdaterProvider } from "./updater/updater.jsx";
+import { ToastProvider } from "./toast/toast.jsx";
+import { AppInstallerProvider } from "./appinstaller/appinstaller.jsx";
+import { DMGInstallerProvider } from "./dmginstaller/dmginstaller.jsx";
+
+// ─────────────── Sistema ───────────────
+import { SyslogsProvider, useSyslogs } from "./system/syslogs.jsx";
+import { SyscallsProvider, useSyscalls } from "./system/syscalls.jsx";
+import { SysfilteredProvider } from "./system/sysfiltered.jsx";
+import { DiagnoseProvider, useDiagnose } from "./system/sysdiagnose.jsx";
+import {
+  BatteryDiagnosticProvider,
+  useBatteryDiagnostic,
+} from "./system/sysbatdiagnostic.jsx";
+
+// ─────────────── Hardware ───────────────
+import { BatteryProvider, useBattery } from "./hardware/battery.jsx";
+import {
+  ChargeSystemProvider,
+  useChargeSystem,
+} from "./hardware/chargesystem.jsx";
+import { DriversProvider, useDrivers } from "./hardware/drivers.jsx";
+import { DisplayProvider, useDisplay } from "./hardware/display.jsx";
+import { AudioProvider, useAudio } from "./hardware/audio.jsx";
+import { NetworkProvider, useNetwork } from "./hardware/network.jsx";
+import { UsbProvider, useUsb } from "./hardware/usb.jsx";
+import { BluetoothProvider, useBluetooth } from "./hardware/bluetooth.jsx";
+import { CameraProvider, useCamera } from "./hardware/camera.jsx";
+import { ThermalProvider, useThermals } from "./hardware/thermals.jsx";
+
+// ─────────────── Seguridad ───────────────
+import { SecurityManager, installSecurityHooks } from "./security/security.jsx";
+
+// ─────────────── Runtime de apps ───────────────
+import {
+  RuntimeProvider,
+  buildSystemApps,
+  useRuntime,
+} from "./runtime/runtime.jsx";
+
+// ─────────────── Bloqueo ───────────────
+import {
+  LockScreenProvider,
+  LockScreenView,
+} from "./lockscreen/lockscreen.jsx";
+
+// ─────────────── Chrome del escritorio ───────────────
+import { Desktop } from "./desktop/desktop.jsx";
+import { MenuBar } from "./menubar/menubar.jsx";
+import { Dock } from "./dock/dock.jsx";
+import { Launchpad } from "./launchpad/launchpad.jsx";
+import { Spotlight } from "./spotlight/spotlight.jsx";
+import { Notifications } from "./notifications/notifications.jsx";
+import { MissionControl } from "./missioncontrol/missioncontrol.jsx";
+import { ControlCenter } from "./controlcenter/controlcenter.jsx";
+import { AppSwitcher } from "./appswitcher/appswitcher.jsx";
+
+// ─────────────── Apps del sistema ───────────────
+import { Finder }   from "./apps/finder/finder.jsx";
+import { Safari }   from "./apps/safari/safari.jsx";
+import { Music }    from "./apps/music/music.jsx";
+import { Photos }   from "./apps/photos/photos.jsx";
+import { Terminal } from "./apps/terminal/terminal.jsx";
+import { Notes }    from "./apps/notes/notes.jsx";
+import { Settings } from "./apps/settings/settings.jsx";
+import { About }    from "./apps/about/about.jsx";
+
+// ============================================================================
+// APPS DEL SISTEMA
+// ============================================================================
+
+const SYSTEM_APPS = buildSystemApps({
+  Finder,
+  Safari,
+  Music,
+  Photos,
+  Terminal,
+  Notes,
+  Settings,
+  About,
+});
+
+// ============================================================================
+// SECURITY CONTEXT
+// ============================================================================
+
+const SecurityContext = React.createContext(null);
+
+export function useSecurity() {
+  const ctx = useContext(SecurityContext);
+  if (!ctx) throw new Error("useSecurity must be used within SecurityContext");
+  return ctx;
+}
+
+function SecurityProvider({ security, children }) {
+  return (
+    <SecurityContext.Provider value={security}>
+      {children}
+    </SecurityContext.Provider>
+  );
+}
+
+// ============================================================================
+// SUB-BRIDGE: ChargeSystem necesita la Battery
+// ============================================================================
+
+function ChargeSystemBridge({ children }) {
+  const batteryApi = useBattery();
+  return (
+    <ChargeSystemProvider battery={batteryApi.battery} autoStart>
+      {children}
+    </ChargeSystemProvider>
+  );
+}
+
+// ============================================================================
+// SUB-BRIDGE: Diagnose necesita todos los subsistemas
+// ============================================================================
+
+function DiagnoseBridge({ children }) {
+  const syslogsApi = useSyslogs();
+  const syscallsApi = useSyscalls();
+  const batteryApi = useBattery();
+  const chargeApi = useChargeSystem();
+  const driversApi = useDrivers();
+  const displayApi = useDisplay();
+  const audioApi = useAudio();
+  const networkApi = useNetwork();
+  const usbApi = useUsb();
+  const bluetoothApi = useBluetooth();
+  const cameraApi = useCamera();
+  const thermalApi = useThermals();
+  const security = useContext(SecurityContext);
+
+  const ctxFactory = useMemo(
+    () => () => ({
+      battery: batteryApi.battery,
+      chargeSystem: chargeApi.system,
+      syslogs: syslogsApi.system,
+      syscalls: syscallsApi.table,
+      drivers: driversApi.manager,
+      display: displayApi.manager,
+      audio: audioApi.manager,
+      network: networkApi.manager,
+      usb: usbApi.bus,
+      bluetooth: bluetoothApi.manager,
+      camera: cameraApi.manager,
+      thermal: thermalApi.manager,
+      security,
+      crashes: [],
+      spindumps: [],
+      bootTime:
+        typeof performance !== "undefined"
+          ? performance.timeOrigin ?? Date.now()
+          : Date.now(),
+    }),
+    [
+      batteryApi, chargeApi, syslogsApi, syscallsApi, driversApi, displayApi,
+      audioApi, networkApi, usbApi, bluetoothApi, cameraApi, thermalApi, security,
+    ]
+  );
+
+  return <DiagnoseProvider ctxFactory={ctxFactory}>{children}</DiagnoseProvider>;
+}
+
+// ============================================================================
+// SUB-BRIDGE: BatteryDiagnostic
+// ============================================================================
+
+function BatteryDiagnosticBridge({ children }) {
+  const batteryApi = useBattery();
+  const chargeApi = useChargeSystem();
+  const syslogsApi = useSyslogs();
+
+  return (
+    <BatteryDiagnosticProvider
+      battery={batteryApi.battery}
+      chargeSystem={chargeApi.system}
+      syslogs={syslogsApi.system}
+    >
+      {children}
+    </BatteryDiagnosticProvider>
+  );
+}
+
+// ============================================================================
+// SYSTEM BRIDGE — wirea eventos entre todos los subsistemas
+// ============================================================================
+
+function SystemBridge({ children }) {
+  const syslogsApi = useSyslogs();
+  const batteryApi = useBattery();
+  const chargeApi = useChargeSystem();
+  const driversApi = useDrivers();
+  const displayApi = useDisplay();
+  const audioApi = useAudio();
+  const networkApi = useNetwork();
+  const usbApi = useUsb();
+  const bluetoothApi = useBluetooth();
+  const cameraApi = useCamera();
+  const thermalApi = useThermals();
+
+  // ---------------------------------------------------------------- batería → logs + thermal
+  useEffect(() => {
+    const offs = [
+      kernelBus.on("battery:low", (p) => {
+        syslogsApi.info("com.rainos.battery", "power", "Batería baja", p);
+      }),
+      kernelBus.on("battery:critical", (p) => {
+        syslogsApi.error("com.rainos.battery", "power", "Batería crítica", p);
+        thermalApi.setPolicy("efficiency");
+      }),
+      kernelBus.on("battery:plugged", (p) => {
+        syslogsApi.info("com.rainos.battery", "charger", "Cargador enchufado", p);
+        thermalApi.setLoad("battery", 4);
+      }),
+      kernelBus.on("battery:unplugged", (p) => {
+        syslogsApi.info("com.rainos.battery", "charger", "Cargador desenchufado", p);
+        thermalApi.setLoad("battery", 0);
+      }),
+      kernelBus.on("battery:overheat", (p) => {
+        syslogsApi.error("com.rainos.battery", "thermal", "Sobrecalentamiento", p);
+        chargeApi.cancelFullCharge?.();
+      }),
+      kernelBus.on("battery:full", (p) => {
+        syslogsApi.info("com.rainos.battery", "charger", "Batería completa", p);
+      }),
+      kernelBus.on("battery:health-degraded", (p) => {
+        syslogsApi.warn("com.rainos.battery", "health", "Salud degradada", p);
+      }),
+      kernelBus.on("battery:cycle", (p) => {
+        syslogsApi.info("com.rainos.battery", "cycles", `Ciclos: ${p.cycleCount}`, p);
+      }),
+    ];
+    return () => offs.forEach((off) => off());
+  }, [syslogsApi, thermalApi, chargeApi]);
+
+  // ---------------------------------------------------------------- charge → logs
+  useEffect(() => {
+    const offs = [
+      kernelBus.on("charge:state-changed", (p) =>
+        syslogsApi.info("com.rainos.charge", "state", `Carga: ${p.from} → ${p.to}`, p)
+      ),
+      kernelBus.on("charge:charger-attached", (p) =>
+        syslogsApi.info("com.rainos.charge", "attach", `Cargador ${p.kind} (${p.watts}W)`, p)
+      ),
+      kernelBus.on("charge:charger-detached", (p) =>
+        syslogsApi.info("com.rainos.charge", "detach", `Cargador desconectado (era ${p.prevKind})`, p)
+      ),
+      kernelBus.on("charge:optimized-pause", (p) =>
+        syslogsApi.info("com.rainos.charge", "optimized", `Carga pausada al ${Math.round(p.limit * 100)}%`, p)
+      ),
+      kernelBus.on("charge:optimized-resume", (p) =>
+        syslogsApi.info("com.rainos.charge", "optimized", "Carga reanudada", p)
+      ),
+      kernelBus.on("charge:overheat", (p) =>
+        syslogsApi.error("com.rainos.charge", "thermal", `Pausa por temperatura ${p.temperatureC.toFixed(1)}°C`, p)
+      ),
+    ];
+    return () => offs.forEach((off) => off());
+  }, [syslogsApi]);
+
+  // ---------------------------------------------------------------- drivers → logs
+  useEffect(() => {
+    const offs = [
+      kernelBus.on("driver:registered", (p) =>
+        syslogsApi.debug("com.rainos.driver", "register", `Driver ${p.id}@${p.version}`, p)
+      ),
+      kernelBus.on("driver:started", (p) =>
+        syslogsApi.debug("com.rainos.driver", "lifecycle", `Driver started: ${p.driverId}`, p)
+      ),
+      kernelBus.on("driver:probe-failed", (p) =>
+        syslogsApi.error("com.rainos.driver", "probe", `Probe failed: ${p.driverId}`, p)
+      ),
+      kernelBus.on("driver:irq-fired", (p) =>
+        syslogsApi.debug("com.rainos.driver", "irq", `IRQ ${p.irq}`, p)
+      ),
+    ];
+    return () => offs.forEach((off) => off());
+  }, [syslogsApi]);
+
+  // ---------------------------------------------------------------- syscalls con error → logs
+  useEffect(() => {
+    const off = kernelBus.on("syscall:called", (entry) => {
+      if (entry.blocked || entry.errno !== 0) {
+        syslogsApi.warn(
+          "com.rainos.syscall",
+          entry.category || "misc",
+          `syscall ${entry.name} #${entry.number} → ${entry.errnoName}`,
+          { pid: entry.pid, args: entry.args }
+        );
+      }
+    });
+    return off;
+  }, [syslogsApi]);
+
+  // ---------------------------------------------------------------- display → logs
+  useEffect(() => {
+    const offs = [
+      kernelBus.on("display:connected", (p) =>
+        syslogsApi.info("com.rainos.display", "hotplug", `Display conectado: ${p.name}`, p)
+      ),
+      kernelBus.on("display:mode-changed", (p) =>
+        syslogsApi.info("com.rainos.display", "mode", `Modo: ${p.mode.width}x${p.mode.height}@${p.mode.refresh}Hz`, p)
+      ),
+      kernelBus.on("display:hdr-changed", (p) =>
+        syslogsApi.info("com.rainos.display", "hdr", `HDR: ${p.hdrMode}`, p)
+      ),
+    ];
+    return () => offs.forEach((off) => off());
+  }, [syslogsApi]);
+
+  // ---------------------------------------------------------------- audio → logs
+  useEffect(() => {
+    const offs = [
+      kernelBus.on("audio:device-added", (p) =>
+        syslogsApi.info("com.rainos.audio", "device", `Dispositivo añadido: ${p.name}`, p)
+      ),
+      kernelBus.on("audio:device-removed", (p) =>
+        syslogsApi.info("com.rainos.audio", "device", `Dispositivo removido: ${p.deviceId}`, p)
+      ),
+      kernelBus.on("audio:default-output-changed", (p) =>
+        syslogsApi.info("com.rainos.audio", "route", `Salida por defecto: ${p.id}`, p)
+      ),
+    ];
+    return () => offs.forEach((off) => off());
+  }, [syslogsApi]);
+
+  // ---------------------------------------------------------------- network → logs
+  useEffect(() => {
+    const offs = [
+      kernelBus.on("network:reachability-changed", (p) =>
+        syslogsApi.info("com.rainos.network", "reachability", p.online ? "Online" : "Offline", p)
+      ),
+      kernelBus.on("network:request-completed", (p) =>
+        syslogsApi.debug("com.rainos.network", "http", `${p.method} ${p.url} → ${p.status} (${p.durationMs}ms)`, p)
+      ),
+      kernelBus.on("network:request-failed", (p) =>
+        syslogsApi.error("com.rainos.network", "http", `Fallo: ${p.url}`, p)
+      ),
+      kernelBus.on("network:dns-failed", (p) =>
+        syslogsApi.warn("com.rainos.network", "dns", `DNS falló: ${p.host}`, p)
+      ),
+      kernelBus.on("network:firewall-blocked", (p) =>
+        syslogsApi.warn("com.rainos.network", "firewall", `Bloqueado: ${p.host}`, p)
+      ),
+    ];
+    return () => offs.forEach((off) => off());
+  }, [syslogsApi]);
+
+  // ---------------------------------------------------------------- USB → logs
+  useEffect(() => {
+    const offs = [
+      kernelBus.on("usb:device-attached", (p) =>
+        syslogsApi.info("com.rainos.usb", "attach", `USB conectado: ${p.productName}`, p)
+      ),
+      kernelBus.on("usb:device-detached", (p) =>
+        syslogsApi.info("com.rainos.usb", "detach", `USB desconectado: ${p.deviceId}`, p)
+      ),
+      kernelBus.on("usb:device-enumerated", (p) =>
+        syslogsApi.info("com.rainos.usb", "enumerate", `Enumerado en ${p.durationMs}ms`, p)
+      ),
+      kernelBus.on("usb:device-error", (p) =>
+        syslogsApi.error("com.rainos.usb", "error", `Error en ${p.deviceId}`, p)
+      ),
+    ];
+    return () => offs.forEach((off) => off());
+  }, [syslogsApi]);
+
+  // ---------------------------------------------------------------- Bluetooth → logs + Audio
+  useEffect(() => {
+    const offs = [
+      kernelBus.on("bt:adapter-state-changed", (p) =>
+        syslogsApi.info("com.rainos.bluetooth", "adapter", `Adapter: ${p.from} → ${p.to}`, p)
+      ),
+      kernelBus.on("bt:device-added", (p) =>
+        syslogsApi.info("com.rainos.bluetooth", "device", `BT detectado: ${p.name}`, p)
+      ),
+      kernelBus.on("bt:pair-succeeded", (p) =>
+        syslogsApi.info("com.rainos.bluetooth", "pair", `Emparejado: ${p.deviceId}`, p)
+      ),
+      kernelBus.on("bt:pair-failed", (p) =>
+        syslogsApi.error("com.rainos.bluetooth", "pair", `Fallo pairing: ${p.deviceId}`, p)
+      ),
+      kernelBus.on("bt:connect-succeeded", (p) => {
+        syslogsApi.info("com.rainos.bluetooth", "connect", `Conectado: ${p.deviceId}`, p);
+        // Si es un dispositivo de audio, registrar como salida de audio
+        const device = bluetoothApi.manager.getDevice(p.deviceId);
+        if (device?.profiles.has?.("a2dp")) {
+          audioApi.manager.addDevice({
+            id: `audio-bt-${p.deviceId}`,
+            name: device.name,
+            kind: "bluetooth",
+            isOutput: true,
+          });
+        }
+      }),
+      kernelBus.on("bt:disconnected", (p) => {
+        syslogsApi.info("com.rainos.bluetooth", "disconnect", `Desconectado: ${p.deviceId}`, p);
+        // Desregistrar salida de audio BT
+        audioApi.manager.removeDevice(`audio-bt-${p.deviceId}`);
+      }),
+      kernelBus.on("bt:notification-received", (p) =>
+        syslogsApi.info("com.rainos.bluetooth", "ancs", `Notificación: ${p.title}`, p)
+      ),
+    ];
+    return () => offs.forEach((off) => off());
+  }, [syslogsApi, audioApi, bluetoothApi]);
+
+  // ---------------------------------------------------------------- Camera → logs
+  useEffect(() => {
+    const offs = [
+      kernelBus.on("camera:permission-granted", (p) =>
+        syslogsApi.info("com.rainos.camera", "permission", "Permiso concedido", p)
+      ),
+      kernelBus.on("camera:permission-denied", (p) =>
+        syslogsApi.warn("com.rainos.camera", "permission", "Permiso denegado", p)
+      ),
+      kernelBus.on("camera:stream-started", (p) =>
+        syslogsApi.info("com.rainos.camera", "stream", `Stream iniciado: ${p.deviceId}`, p)
+      ),
+      kernelBus.on("camera:photo-captured", (p) =>
+        syslogsApi.info("com.rainos.camera", "photo", `Foto capturada (${p.width}x
             // ---------------------------------------------------------------- Camera → logs
       useEffect(() => {
         const offs = [
@@ -22,38 +489,7 @@
           ),
         ];
         return () => offs.forEach((off) => off());
-      }, [syslogsApi]);
-
-      // ---------------------------------------------------------------- Thermal → logs
-      useEffect(() => {
-        const offs = [
-          kernelBus.on("thermal:trip-crossed", (p) =>
-            syslogsApi.warn("com.rainos.thermal", "trip", `Trip L${p.level} en ${p.zoneId} (${p.tempC.toFixed(1)}°C)`, p)
-          ),
-          kernelBus.on("thermal:trip-recovered", (p) =>
-            syslogsApi.info("com.rainos.thermal", "trip", `Recuperado en ${p.zoneId} (${p.tempC.toFixed(1)}°C)`, p)
-          ),
-          kernelBus.on("thermal:throttle-start", (p) =>
-            syslogsApi.warn("com.rainos.thermal", "throttle", `Throttling iniciado (${Math.round(p.throttle * 100)}%)`, p)
-          ),
-          kernelBus.on("thermal:throttle-stop", () =>
-            syslogsApi.info("com.rainos.thermal", "throttle", "Throttling detenido", {})
-          ),
-          kernelBus.on("thermal:critical-reached", (p) =>
-            syslogsApi.error("com.rainos.thermal", "critical", `Nivel crítico alcanzado (${p.level})`, p)
-          ),
-          kernelBus.on("thermal:emergency-reached", (p) =>
-            syslogsApi.error("com.rainos.thermal", "emergency", `Emergencia térmica (${p.level})`, p)
-          ),
-          kernelBus.on("thermal:shutdown", (p) =>
-            syslogsApi.error("com.rainos.thermal", "shutdown", `Apagado por temperatura: ${p.tempC}°C`, p)
-          ),
-          kernelBus.on("thermal:fan-update", (p) =>
-            syslogsApi.debug("com.rainos.thermal", "fan", `Fan ${p.coolerId}: ${p.rpm} rpm`, p)
-          ),
-        ];
-        return () => offs.forEach((off) => off());
-      }, [syslogsApi]);
+      }, 
 
       // ---------------------------------------------------------------- Security → logs
       useEffect(() => {
