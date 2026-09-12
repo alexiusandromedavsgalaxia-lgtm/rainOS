@@ -2398,14 +2398,18 @@ export function createExecutor(vcpu, arch) {
   }
   throw new Error(`unsupported arch: ${arch}`);
 }
+// Al final de xcode-executor.jsx
+import { patchArm64, patchX86_64 } from "./xcode-executor-patch.jsx";
 
-// ============================================================================
-// 8. EXPORTS
-// ============================================================================
-
-export default {
-  Arm64Executor,
-  X86_64Executor,
-  createExecutor,
-  EXECUTOR_STATE,
-};
+export function createExecutor(vcpu, arch) {
+  const a = String(arch || "").toLowerCase();
+  if (a.startsWith("arm64")) {
+    const executor = new Arm64Executor(vcpu, { isArm64E: a === "arm64e" });
+    return patchArm64(executor);  // <-- aplica las implementaciones reales
+  }
+  if (a.startsWith("x86_64")) {
+    const executor = new X86_64Executor(vcpu);
+    return patchX86_64(executor);  // <-- aplica AVX-512 real
+  }
+  throw new Error(`unsupported arch: ${arch}`);
+}
