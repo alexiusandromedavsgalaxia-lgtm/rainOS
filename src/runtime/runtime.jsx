@@ -50,7 +50,20 @@ const terminalIcon = "⌨️";
 const notesIcon = "📝";
 const settingsIcon = "⚙️";
 const aboutIcon = "ℹ️";
+import { Safari } from "rainOS/apps/safari";
+import { Music } from "rainOS/apps/music";
+import { Photos } from "rainOS/apps/photos";
 
+const SYSTEM_APPS = buildSystemApps({
+  Finder,
+  Terminal,
+  Notes,
+  Settings,
+  About,
+  Safari,
+  Music,
+  Photos,
+});
 function Shell() {
   return (
     <>
