@@ -1614,49 +1614,245 @@ export class ARM64Executor {
 
     return null;
   }
+  
   _execDataProcReg(insn) {
-    // ADD/SUB/AND/ORR/EOR + shifted register variants
-    const rm = bits(insn, 20, 16);
-    const rn = bits(insn, 9, 5);
-    const rd = bits(insn, 4, 0);
-    const op = bits(insn, 28, 21);
-    const sf = bit(insn, 31);
-    const isSub = bit(insn, 30) === 1;
+    // ============================================================
+    // Data Processing — Register
+    // ============================================================
+    // Cubre:
+    //   - Logical (shifted register): AND / ORR / EOR / ANDS /
+    //     BIC / ORN / EON / BICS, con shift LSL/LSR/ASR/ROR
+    //   - Add/subtract (shifted register): ADD / ADDS / SUB / SUBS
+    //     con shift
+    //   - Data-processing (2 source): LSLV / LSRV / ASRV / RORV /
+    //     UDIV / SDIV
+    //   - Data-processing (3 source): MADD / MSUB / SMADDL / SMSUBL /
+    //     SMULH / UMADDL / UMSUBL / UMULH
+    //
+    // No cubre (fallback honesto "dataproc-unimpl"):
+    //   - Add/subtract (extended register)  (ADD X0, X1, W2, UXTB #3)
+    //   - Conditional select (CSEL/CSINC/CSINV/CSNEG)
+    //   - Conditional compare (CCMN/CCMP)
+    //   - Data-processing (1 source) (RBIT/REV/CLZ/CLS)
+    // ============================================================
 
-    const a = this.readX(rn);
-    const b = this.readX(rm);
+    const sf   = bit(insn, 31);       // 1 = 64-bit, 0 = 32-bit
+    const op54 = bits(insn, 28, 24);  // familia
+    const N    = bit(insn, 21);       // en Logical: N; en Add/sub: op
+    const Rm   = bits(insn, 20, 16);
+    const shiftType = bits(insn, 23, 22);
+    const shiftAmt  = bits(insn, 15, 10);
+    const Rn   = bits(insn, 9, 5);
+    const Rd   = bits(insn, 4, 0);
 
-    if (op === 0x0b || op === 0x8b) {
-      // ADD
-      const r = this._addWithFlags(a, b, false, !sf);
-      this.writeX(rd, r.result);
-      if (bit(insn, 29)) {
-        this.nzcv.n = r.n; this.nzcv.z = r.z;
-        this.nzcv.c = r.c; this.nzcv.v = r.v;
+    const is64 = sf === 1;
+    const width = is64 ? 64n : 32n;
+    const widthMask = (1n << width) - 1n;
+
+    // ------------------------------------------------------------
+    // Helper: aplica shift al operando B según shiftType y shiftAmt.
+    // Se opera siempre dentro del ancho (32 o 64 bits).
+    // ------------------------------------------------------------
+    const applyShift = (value, type, amt) => {
+      if (amt === 0 && type !== 0b11) return u64(value) & widthMask;
+      const v = u64(value) & widthMask;
+      switch (type) {
+        case 0b00: // LSL
+          return u64((v << BigInt(amt)) & widthMask);
+        case 0b01: // LSR
+          return u64(v >> BigInt(amt));
+        case 0b10: // ASR (aritmético)
+          return u64(BigInt.asIntN(Number(width), v) >> BigInt(amt)) & widthMask;
+        case 0b11: // ROR
+          if (amt === 0) return v;
+          return u64(((v >> BigInt(amt)) | (v << (width - BigInt(amt)))) & widthMask);
+        default:
+          return v;
       }
-      return { mnemonic: "add", cycles: 1 };
-    }
-    if (op === 0x4b || op === 0xcb) {
-      // SUB
-      const r = this._addWithFlags(a, b, true, !sf);
-      this.writeX(rd, r.result);
-      if (bit(insn, 29)) {
-        this.nzcv.n = r.n; this.nzcv.z = r.z;
-        this.nzcv.c = r.c; this.nzcv.v = r.v;
+    };
+
+    // ------------------------------------------------------------
+    // Logical (shifted register): op54 = 0b01010
+    //   opc = bits[30:29] = [opc1, S]
+    //     N=0: 00=AND, 01=ORR, 10=EOR, 11=ANDS
+    //     N=1: 00=BIC, 01=ORN, 10=EON, 11=BICS
+    // ------------------------------------------------------------
+    if (op54 === 0b01010) {
+      const a = u64(this.readX(Rn)) & widthMask;
+      const b = u64(this.readX(Rm)) & widthMask;
+      const shifted = applyShift(b, shiftType, shiftAmt);
+      const opc = bits(insn, 30, 29); // 2 bits, incluye S
+
+      let result;
+      let mnemonic;
+
+      if (N === 0) {
+        switch (opc) {
+          case 0b00: result = u64(a & shifted);              mnemonic = "and";  break;
+          case 0b01: result = u64(a | shifted);              mnemonic = "orr";  break;
+          case 0b10: result = u64(a ^ shifted);              mnemonic = "eor";  break;
+          case 0b11: result = u64(a & shifted);              mnemonic = "ands"; break;
+          default:   return { mnemonic: "dataproc-unimpl", insn: hex(insn, 8), cycles: 1 };
+        }
+      } else {
+        const notShifted = (~shifted) & widthMask;
+        switch (opc) {
+          case 0b00: result = u64(a & notShifted);           mnemonic = "bic";  break;
+          case 0b01: result = u64(a | notShifted);           mnemonic = "orn";  break;
+          case 0b10: result = u64(a ^ notShifted);           mnemonic = "eon";  break;
+          case 0b11: result = u64(a & notShifted);           mnemonic = "bics"; break;
+          default:   return { mnemonic: "dataproc-unimpl", insn: hex(insn, 8), cycles: 1 };
+        }
       }
-      return { mnemonic: "sub", cycles: 1 };
-    }
-    if (op === 0x2a || op === 0x6a) {
-      // ORR / EOR
-      const r = u64(a ^ b);
-      this.writeX(rd, r);
-      this._logicalFlags(r, !sf);
-      return { mnemonic: "orr/eor", cycles: 1 };
+
+      this.writeX(Rd, u64(result));
+
+      // Flags: solo cuando opc[0] = 1 (ANDS, BICS)
+      if (opc === 0b11) {
+        this._logicalFlags(result, !is64);
+      }
+
+      return { mnemonic, cycles: 1 };
     }
 
+    // ------------------------------------------------------------
+    // Add/subtract (shifted register): op54 = 0b01011
+    //   N (bit 21) = 0 → ADD, 1 → SUB
+    //   S (bit 29) = 1 → ADDS/SUBS
+    // ------------------------------------------------------------
+    if (op54 === 0b01011) {
+      const a = u64(this.readX(Rn)) & widthMask;
+      const b = u64(this.readX(Rm)) & widthMask;
+      const shifted = applyShift(b, shiftType, shiftAmt);
+      const S = bit(insn, 29);
+
+      const isSub = N === 1;
+      const r = this._addWithFlags(a, shifted, isSub, !is64);
+      this.writeX(Rd, u64(r.result));
+
+      if (S === 1) {
+        this.nzcv.n = r.n;
+        this.nzcv.z = r.z;
+        this.nzcv.c = r.c;
+        this.nzcv.v = r.v;
+      }
+
+      const mnemonic = (isSub ? "sub" : "add") + (S === 1 ? "s" : "");
+      return { mnemonic, cycles: 1 };
+    }
+
+    // ------------------------------------------------------------
+    // Data-processing (2 source): op54 = 0b11010
+    //   LSLV / LSRV / ASRV / RORV / UDIV / SDIV
+    // ------------------------------------------------------------
+    if (op54 === 0b11010) {
+      const a = u64(this.readX(Rn)) & widthMask;
+      const b = u64(this.readX(Rm)) & widthMask;
+      const op2 = bits(insn, 15, 10);
+      const shBits = BigInt(Number(width) - 1);
+      const sh = b & shBits;
+
+      let result;
+      let mnemonic;
+      switch (op2) {
+        case 0b001000: // LSLV
+          result = u64((a << sh) & widthMask);
+          mnemonic = "lslv";
+          break;
+        case 0b001001: // LSRV
+          result = u64(a >> sh);
+          mnemonic = "lsrv";
+          break;
+        case 0b001010: // ASRV
+          result = u64(BigInt.asIntN(Number(width), a) >> sh) & widthMask;
+          mnemonic = "asrv";
+          break;
+        case 0b001011: // RORV
+          if (sh === 0n) result = a;
+          else result = u64(((a >> sh) | (a << (width - sh))) & widthMask);
+          mnemonic = "rorv";
+          break;
+        case 0b000010: { // UDIV
+          const bu = BigInt.asUintN(Number(width), b);
+          result = bu === 0n ? 0n : BigInt.asUintN(Number(width), a) / bu;
+          mnemonic = "udiv";
+          break;
+        }
+        case 0b000011: { // SDIV
+          const bs = BigInt.asIntN(Number(width), b);
+          const as = BigInt.asIntN(Number(width), a);
+          result = bs === 0n ? 0n : BigInt.asUintN(Number(width), as / bs);
+          mnemonic = "sdiv";
+          break;
+        }
+        default:
+          return { mnemonic: "dataproc-unimpl", insn: hex(insn, 8), cycles: 1 };
+      }
+
+      this.writeX(Rd, u64(result));
+      return { mnemonic, cycles: 1 };
+    }
+
+    // ------------------------------------------------------------
+    // Data-processing (3 source): op54 = 0b11011
+    //   MADD / MSUB / SMADDL / SMSUBL / SMULH / UMADDL / UMSUBL / UMULH
+    //   Ra está en bits[14:10]
+    // ------------------------------------------------------------
+    if (op54 === 0b11011) {
+      const Ra  = bits(insn, 14, 10);
+      const a   = u64(this.readX(Rn));
+      const b   = u64(this.readX(Rm));
+      const acc = u64(this.readX(Ra));
+      const op31 = bits(insn, 23, 21);
+      const o0   = bit(insn, 15);
+
+      let result;
+      let mnemonic;
+
+      if (op31 === 0b000) {
+        // MADD / MSUB
+        const prod = u64(a * b);
+        if (o0 === 0) { result = u64(prod + acc); mnemonic = "madd"; }
+        else          { result = u64(acc - prod); mnemonic = "msub"; }
+      } else if (op31 === 0b001) {
+        // SMADDL / SMSUBL
+        const aa = BigInt.asIntN(32, a);
+        const bb = BigInt.asIntN(32, b);
+        const prod = BigInt.asUintN(64, aa * bb);
+        if (o0 === 0) { result = u64(prod + acc); mnemonic = "smaddl"; }
+        else          { result = u64(acc - prod); mnemonic = "smsubl"; }
+      } else if (op31 === 0b010) {
+        // SMULH
+        const prod = BigInt.asIntN(64, a) * BigInt.asIntN(64, b);
+        result = u64(prod >> 64n);
+        mnemonic = "smulh";
+      } else if (op31 === 0b101) {
+        // UMADDL / UMSUBL
+        const aa = BigInt.asUintN(32, a);
+        const bb = BigInt.asUintN(32, b);
+        const prod = aa * bb;
+        if (o0 === 0) { result = u64(prod + acc); mnemonic = "umaddl"; }
+        else          { result = u64(acc - prod); mnemonic = "umsubl"; }
+      } else if (op31 === 0b110) {
+        // UMULH
+        const prod = BigInt.asUintN(64, a) * BigInt.asUintN(64, b);
+        result = u64(prod >> 64n);
+        mnemonic = "umulh";
+      } else {
+        return { mnemonic: "dataproc-unimpl", insn: hex(insn, 8), cycles: 1 };
+      }
+
+      this.writeX(Rd, u64(result));
+      return { mnemonic, cycles: 1 };
+    }
+
+    // ------------------------------------------------------------
+    // Todo lo demás (Conditional select, conditional compare,
+    // extended register, 1-source): fallback honesto.
+    // ------------------------------------------------------------
     return { mnemonic: "dataproc-unimpl", insn: hex(insn, 8), cycles: 1 };
   }
-
+  
   _execSIMDFP(insn) {
     // ADD/SUB/FMUL/FDIV/FMLA/SIMD + conversions
     // Implementación mínima: FP32 y FP64 en V0/V1 → V0
