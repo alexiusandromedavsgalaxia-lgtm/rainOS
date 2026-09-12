@@ -42,6 +42,9 @@ const SYSTEM_APPS = buildSystemApps({
   Notes,
   Settings,
   About,
+  Safari,
+  Photos,
+  Music,
 });
 
 // Iconos SVG (opcional, si quieres pasar componentes en vez de emojis)
