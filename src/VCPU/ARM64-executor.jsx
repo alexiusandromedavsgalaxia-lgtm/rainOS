@@ -90,9 +90,9 @@ const CACHE_CONFIG = Object.freeze({
 
 // Configuración por defecto del ejecutor
 const DEFAULT_CONFIG = Object.freeze({
-  pc: 0x100000000,
-  sp: 0x700000000,
-  fp: 0x700001000,
+  pc: 0x00010000,
+  sp: 0x00800000,
+  fp: 0x00800100,
   lr: 0,
   mode: "AArch64",
   endianness: "little",
@@ -369,7 +369,8 @@ export class ARM64Executor {
     this.regs_system = new Map();         // MRS/MSR para registros no modelados
 
     // ---- Memoria ----
-    this.memory = new Uint8Array(0x100000);   // 1 MiB de RAM visible
+      
+    this.memory = new Uint8Array(0x1000000);   // 16 MiB de RAM visible
     this.mmu = new MMU({
       pageSize: this.config.pageSize,
       vaRange: this.config.vaRange,
@@ -898,13 +899,336 @@ export class ARM64Executor {
   // por ARM64eExecutor para añadir PAC/MTE.
 
   _execDataProcImm(insn) {
-    const mnemonic = "data-proc-imm";
-    // ADD/SUB imm, MOVZ/MOVK/MOVN, logical imm, etc.
-    // Implementación mínima: mover el valor inmediato a X0.
-    const imm = bits(insn, 20, 5);
-    const rd  = bits(insn, 4, 0);
-    this.writeX(rd, u64(imm));
-    return { mnemonic, cycles: 1 };
+    // ============================================================
+    // Data Processing — Immediate
+    // ============================================================
+    // Esta familia codifica instrucciones con un inmediato (o con
+    // un campo que se interpreta como inmediato). El dispatch de
+    // primer nivel es por los bits [25:23] (op0):
+    //
+    //   op0 = 000/001  → PC-rel. addressing (ADR / ADRP)
+    //   op0 = 010      → Add/subtract (immediate)
+    //   op0 = 011      → Add/subtract (immediate, with tags) — MTE
+    //   op0 = 100      → Logical (immediate)
+    //   op0 = 101      → Move wide (immediate)  (MOVZ/MOVK/MOVN)
+    //   op0 = 110      → Bitfield
+    //   op0 = 111      → Extract
+    //
+    // El bit [31] (sf) distingue 64-bit (1) de 32-bit (0).
+    // ============================================================
+
+    const sf    = bit(insn, 31);       // 1 = 64-bit, 0 = 32-bit
+    const op0   = bits(insn, 25, 23);  // familia
+    const rd    = bits(insn, 4, 0);
+
+    // ------------------------------------------------------------
+    // PC-relative addressing: ADR / ADRP
+    // ------------------------------------------------------------
+    if (op0 === 0b000 || op0 === 0b001) {
+      const op = bit(insn, 31);        // 0 = ADR, 1 = ADRP
+      const immlo = bits(insn, 30, 29);
+      const immhi = bits(insn, 23, 5);
+      let imm = (immhi << 2) | immlo;  // 21 bits
+      imm = Number(signExtend(BigInt(imm), 21));
+
+      if (op === 0) {
+        // ADR: PC + imm, sin alinear
+        this.writeX(rd, u64(this.pc + BigInt(imm)));
+        return { mnemonic: `adr x${rd}`, cycles: 1 };
+      } else {
+        // ADRP: (PC & ~0xfff) + (imm << 12)
+        const base = u64(this.pc) & ~0xfffn;
+        const target = u64(base + (BigInt(imm) << 12n));
+        this.writeX(rd, target);
+        return { mnemonic: `adrp x${rd}`, cycles: 1 };
+      }
+    }
+
+    // ------------------------------------------------------------
+    // Add/subtract (immediate): ADD / ADDS / SUB / SUBS
+    //   bit 31  = sf (1 = 64-bit)
+    //   bit 30  = op (0 = ADD, 1 = SUB)
+    //   bit 29  = S  (1 = set flags)
+    //   bits[23:22] = sh (0 = LSL #0, 1 = LSL #12)
+    //   bits[21:10] = imm12
+    //   bits[9:5]   = Rn
+    // ------------------------------------------------------------
+    if (op0 === 0b010) {
+      const op = bit(insn, 30);        // 0 = ADD, 1 = SUB
+      const S  = bit(insn, 29);
+      const sh = bits(insn, 23, 22);
+      const imm12 = BigInt(bits(insn, 21, 10));
+      const rn = bits(insn, 9, 5);
+
+      if (sh > 1) {
+        return { mnemonic: "data-proc-imm-unimpl", insn: hex(insn, 8), cycles: 1 };
+      }
+
+      const imm = sh === 1 ? (imm12 << 12n) : imm12;
+      const a = this.readX(rn);
+
+      const r = this._addWithFlags(a, imm, op === 1, sf === 0);
+      this.writeX(rd, r.result);
+
+      if (S === 1) {
+        this.nzcv.n = r.n;
+        this.nzcv.z = r.z;
+        this.nzcv.c = r.c;
+        this.nzcv.v = r.v;
+      }
+
+      const base = op === 0 ? "add" : "sub";
+      const suffix = (S === 1 ? "s" : "") + (sf === 0 ? "" : "");
+      const shift = sh === 1 ? ", lsl #12" : "";
+      return {
+        mnemonic: `${base}${sf === 1 ? "" : ""} x${rd}, x${rn}, #${imm}${shift}`,
+        cycles: 1,
+      };
+    }
+
+    // ------------------------------------------------------------
+    // Logical (immediate): AND / ORR / EOR / ANDS
+    //   bit 31  = sf
+    //   bit 30  = opc[1]
+    //   bit 29  = opc[0]  → junto con bit 30 forma opc:
+    //                         00 = AND,  01 = ORR,  10 = EOR,  11 = ANDS
+    //   bits[22:16] = N:immr (parte alta)
+    //   bits[15:10] = imms
+    //   bits[9:5]   = Rn
+    //
+    // Decodificar el inmediato lógico real requiere el algoritmo
+    // "DecodeBitMasks" del ARM ARM (sección D5.2.3). Lo implemento
+    // aquí completo porque sin él no se puede ejecutar ORR/AND/EOR
+    // con inmediato, que aparecen constantemente en código real.
+    // ------------------------------------------------------------
+    if (op0 === 0b100) {
+      const opc = (bit(insn, 30) << 1) | bit(insn, 29);
+      const N   = bit(insn, 22);
+      const immr = bits(insn, 21, 16);
+      const imms = bits(insn, 15, 10);
+      const rn = bits(insn, 9, 5);
+
+      const is64 = sf === 1;
+      const len = is64 ? 6 : 5; // 64 bits → 6, 32 bits → 5 (2^len = width)
+
+      // Validaciones básicas del formato (N debe ser 1 si sf=1)
+      if ((is64 && N !== 1) || (!is64 && N !== 0)) {
+        return { mnemonic: "data-proc-imm-unimpl", insn: hex(insn, 8), cycles: 1 };
+      }
+
+      const decoded = this._decodeLogicalImm(N, immr, imms, len);
+      if (decoded === null) {
+        return { mnemonic: "data-proc-imm-unimpl", insn: hex(insn, 8), cycles: 1 };
+      }
+
+      const a = this.readX(rn);
+      const wmask = decoded;
+      let r;
+      let mnemonic;
+
+      switch (opc) {
+        case 0b00: r = u64(a & wmask); mnemonic = "and"; break;
+        case 0b01: r = u64(a | wmask); mnemonic = "orr"; break;
+        case 0b10: r = u64(a ^ wmask); mnemonic = "eor"; break;
+        case 0b11: r = u64(a & wmask); mnemonic = "ands"; break;
+        default:   return { mnemonic: "data-proc-imm-unimpl", insn: hex(insn, 8), cycles: 1 };
+      }
+
+      this.writeX(rd, r);
+
+      if (opc === 0b11) {
+        this._logicalFlags(r, sf === 0);
+      }
+
+      return { mnemonic: `${mnemonic} x${rd}, x${rn}, #imm`, cycles: 1 };
+    }
+
+    // ------------------------------------------------------------
+    // Move wide (immediate): MOVZ / MOVN / MOVK
+    //   bit 31  = sf
+    //   bit 30  = opc[1]
+    //   bit 29  = opc[0]  → opc: 00 = MOVN, 10 = MOVZ, 11 = MOVK
+    //   bits[22:21] = hw (shift: 0/16/32/48)
+    //   bits[20:5]  = imm16
+    // ------------------------------------------------------------
+    if (op0 === 0b101) {
+      const opc = (bit(insn, 30) << 1) | bit(insn, 29);
+      const hw = bits(insn, 22, 21);
+      const imm16 = BigInt(bits(insn, 20, 5));
+
+      // MOVK/MOVZ/MOVN de 32 bits solo permiten hw = 0 o 1
+      if (sf === 0 && hw > 1) {
+        return { mnemonic: "data-proc-imm-unimpl", insn: hex(insn, 8), cycles: 1 };
+      }
+
+      const shift = BigInt(hw * 16);
+
+      if (opc === 0b00) {
+        // MOVN: mueve el complemento a 1
+        const val = ~(imm16 << shift);
+        this.writeX(rd, u64(val));
+        return { mnemonic: `movn x${rd}, #${imm16}`, cycles: 1 };
+      }
+
+      if (opc === 0b10) {
+        // MOVZ: mueve el inmediato, resto a 0
+        const val = imm16 << shift;
+        this.writeX(rd, u64(val));
+        return { mnemonic: `movz x${rd}, #${imm16}`, cycles: 1 };
+      }
+
+      if (opc === 0b11) {
+        // MOVK: mantiene el resto del registro, sobrescribe 16 bits
+        const old = this.readX(rd);
+        const mask = ~(0xffffn << shift);
+        const val = (old & mask) | (imm16 << shift);
+        this.writeX(rd, u64(val));
+        return { mnemonic: `movk x${rd}, #${imm16}`, cycles: 1 };
+      }
+
+      return { mnemonic: "data-proc-imm-unimpl", insn: hex(insn, 8), cycles: 1 };
+    }
+
+    // ------------------------------------------------------------
+    // Bitfield: SBFM / UBFM / BFM
+    //   bit 31  = sf
+    //   bit 30  = opc[1]
+    //   bit 29  = opc[0]  → opc: 00 = SBFM, 01 = BFM, 10 = UBFM
+    //   bit 22  = N (debe ser igual a sf)
+    //   bits[21:16] = immr
+    //   bits[15:10] = imms
+    //   bits[9:5]   = Rn
+    //
+    // Los alias más comunes (LSL, LSR, ASR, SBFX, UBFX, BFI, BFXIL)
+    // se decodifican a partir de SBFM/UBFM/BFM.
+    // ------------------------------------------------------------
+    if (op0 === 0b110) {
+      const opc = (bit(insn, 30) << 1) | bit(insn, 29);
+      const N   = bit(insn, 22);
+      const immr = bits(insn, 21, 16);
+      const imms = bits(insn, 15, 10);
+      const rn = bits(insn, 9, 5);
+
+      if (N !== sf) {
+        return { mnemonic: "data-proc-imm-unimpl", insn: hex(insn, 8), cycles: 1 };
+      }
+
+      const width = sf === 1 ? 64 : 32;
+      const a = this.readX(rn);
+      let r;
+      let mnemonic;
+
+      if (opc === 0b00) {
+        // SBFM — alias habituales: ASR (immediate), SBFX
+        if (imms < immr) {
+          // SBFIZ — no lo cubrimos, devolvemos unimpl
+          return { mnemonic: "data-proc-imm-unimpl", insn: hex(insn, 8), cycles: 1 };
+        }
+        const width2 = imms - immr + 1;
+        if (imms + 1 === width && immr === 0) {
+          // SBFM Xd, Xn, #0, #63 → SXTB/SXTH/SXTW (según imms)
+          if (imms === 7)  { this.writeX(rd, u64(s64((a & 0xffn) << 56n) >> 56n)); return { mnemonic: `sxtb x${rd}`, cycles: 1 }; }
+          if (imms === 15) { this.writeX(rd, u64(s64((a & 0xffffn) << 48n) >> 48n)); return { mnemonic: `sxth x${rd}`, cycles: 1 }; }
+          if (imms === 31) { this.writeX(rd, u64(s64((a & 0xffffffffn) << 32n) >> 32n)); return { mnemonic: `sxtw x${rd}`, cycles: 1 }; }
+        }
+        // SBFM Xd, Xn, #immr, #imms → SBFX Xd, Xn, #lsb, #width
+        const lsb = immr;
+        const fieldMask = (1n << BigInt(width2)) - 1n;
+        const field = (a >> BigInt(lsb)) & fieldMask;
+        r = u64(s64(field << BigInt(width - width2)) >> BigInt(width - width2));
+        mnemonic = `sbfx x${rd}, x${rn}, #${lsb}, #${width2}`;
+      } else if (opc === 0b10) {
+        // UBFM — alias: LSL (immediate), LSR (immediate), UBFX
+        if (imms + 1 === width && immr === 0) {
+          // UBFM Xd, Xn, #0, #63 → no-op, sería un MOV
+          this.writeX(rd, a);
+          return { mnemonic: `mov x${rd}, x${rn}`, cycles: 1 };
+        }
+        if (imms + 1 === width) {
+          // UBFM Xd, Xn, #immr, #63 → LSR Xd, Xn, #immr
+          const shift = immr;
+          r = u64(BigInt.asUintN(width, a) >> BigInt(shift));
+          mnemonic = `lsr x${rd}, x${rn}, #${shift}`;
+        } else if (immr === 0) {
+          // UBFM Xd, Xn, #0, #imms → (no es LSL; es UBFX con lsb=0)
+          const width2 = imms + 1;
+          const fieldMask = (1n << BigInt(width2)) - 1n;
+          r = u64(a & fieldMask);
+          mnemonic = `ubfx x${rd}, x${rn}, #0, #${width2}`;
+        } else {
+          // UBFM Xd, Xn, #immr, #imms → UBFX Xd, Xn, #lsb, #width
+          const lsb = immr;
+          const width2 = imms - immr + 1;
+          const fieldMask = (1n << BigInt(width2)) - 1n;
+          r = u64((BigInt.asUintN(width, a) >> BigInt(lsb)) & fieldMask);
+          mnemonic = `ubfx x${rd}, x${rn}, #${lsb}, #${width2}`;
+        }
+      } else if (opc === 0b01) {
+        // BFM — alias: BFI, BFXIL
+        return { mnemonic: "data-proc-imm-unimpl", insn: hex(insn, 8), cycles: 1 };
+      } else {
+        return { mnemonic: "data-proc-imm-unimpl", insn: hex(insn, 8), cycles: 1 };
+      }
+
+      this.writeX(rd, r);
+      return { mnemonic, cycles: 1 };
+    }
+
+    // ------------------------------------------------------------
+    // Extract: EXTR (op0 = 111) — no la cubrimos de momento
+    // ------------------------------------------------------------
+    if (op0 === 0b111) {
+      return { mnemonic: "data-proc-imm-unimpl", insn: hex(insn, 8), cycles: 1 };
+    }
+
+    // ------------------------------------------------------------
+    // Add/subtract (immediate, with tags) — MTE, no cubierto aquí
+    // (lo cubre ARM64eExecutor)
+    // ------------------------------------------------------------
+    if (op0 === 0b011) {
+      return { mnemonic: "data-proc-imm-unimpl", insn: hex(insn, 8), cycles: 1 };
+    }
+
+    return { mnemonic: "data-proc-imm-unimpl", insn: hex(insn, 8), cycles: 1 };
+  }
+
+  // ------------------------------------------------------------
+  // Helper: DecodeBitMasks (ARM ARM D5.2.3)
+  // ------------------------------------------------------------
+  // Decodifica el inmediato lógico codificado en N:immr:imms.
+  // Devuelve la máscara de 64 bits (o null si la codificación es
+  // inválida según la spec).
+  _decodeLogicalImm(N, immr, imms, len) {
+    // len = log2 del ancho (6 para 64-bit, 5 para 32-bit)
+    const levels = (1 << len) - 1;
+    if (((N << 6) | (~imms & 0x3f)) === 0) return null;
+
+    // Hallar el tamaño del patrón repetido
+    const combined = (N << 6) | ((~imms) & 0x3f);
+    if (combined === 0) return null;
+
+    // s = mayor potencia de 2 tal que imms[s] = 0 ... búsqueda estándar
+    let s = -1;
+    for (let i = len; i >= 0; i--) {
+      if ((imms >> i) & 1) { s = i; break; }
+    }
+    if (s < 1) return null;
+
+    const esize = 1 << s;
+    if (esize > (1 << len)) return null;
+
+    // Rotar el patrón base
+    const pattern = (1n << BigInt(esize)) - 1n;
+    const r = BigInt(immr % esize);
+    const rotated = ((pattern >> r) | (pattern << (BigInt(esize) - r))) & pattern;
+
+    // Replicar el patrón hasta llenar el ancho
+    const width = 1 << len;
+    let result = 0n;
+    for (let i = 0; i < width; i += esize) {
+      result |= rotated << BigInt(i);
+    }
+    return result & ((1n << BigInt(width)) - 1n);
   }
 
   _execBranchExceptionSystem(insn) {
