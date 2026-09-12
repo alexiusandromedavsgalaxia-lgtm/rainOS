@@ -34,12 +34,12 @@ import React, {
 } from "react";
 
 import { kernelBus } from "../kernel/kernel.jsx";
-import { MachOParser } from "./importer.jsx";
-import { DyldLoader } from "./dyld.jsx";
-import { ObjCRuntime } from "./objc-runtime.jsx";
+import { MachoParser } from "../dmginstaller/macho-loader.jsx";
+import { Dyld } from "./dyld.jsx";
+import { ObjcRuntime } from "./objc-runtime.jsx";
 import { SwiftRuntime } from "./swift-runtime.jsx";
 import { LibSystem } from "./libsystem.jsx";
-import { CoreFoundation } from "./corefoundation.jsx";
+import { CfRuntime } from "./corefoundation.jsx";
 
 // ============================================================================
 // CONSTANTES
@@ -85,7 +85,7 @@ const SYSTEM_FRAMEWORKS = Object.freeze({
   AppKit:            "/System/Library/Frameworks/AppKit.framework/AppKit",
   UIKit:             "/System/Library/Frameworks/UIKit.framework/UIKit",
   SwiftUI:           "/System/Library/Frameworks/SwiftUI.framework/SwiftUI",
-  CoreFoundation:    "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation",
+  CfRuntime:    "/System/Library/Frameworks/CfRuntime.framework/CfRuntime",
   CoreGraphics:      "/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics",
   CoreAudio:         "/System/Library/Frameworks/CoreAudio.framework/CoreAudio",
   CoreVideo:         "/System/Library/Frameworks/CoreVideo.framework/CoreVideo",
@@ -643,7 +643,7 @@ export class AppLauncher {
       if (binary instanceof Uint8Array || binary instanceof ArrayBuffer) {
         const bytes =
           binary instanceof Uint8Array ? binary : new Uint8Array(binary);
-        const parser = new MachOParser(bytes, { path });
+        const parser = new MachoParser(bytes, { path });
         macho = parser.parse();
       } else if (binary && typeof binary === "object") {
         macho = binary;
@@ -744,7 +744,7 @@ export class AppLauncher {
     // ---------------------------------------------------------- dyld
     let dyld;
     try {
-      dyld = new DyldLoader({
+      dyld = new Dyld({
         macho,
         path,
         envp: proc.envp,
@@ -787,7 +787,7 @@ export class AppLauncher {
 
     // ---------------------------------------------------------- ObjC
     try {
-      const objc = new ObjCRuntime({ macho, dyld, process: proc });
+      const objc = new ObjcRuntime({ macho, dyld, process: proc });
       objc.initialize?.();
       proc.objc = objc;
     } catch (err) {
@@ -811,7 +811,7 @@ export class AppLauncher {
     try {
       const libsystem = new LibSystem({ process: proc, dyld });
       libsystem.install?.();
-      const cf = new CoreFoundation({ process: proc, dyld });
+      const cf = new CfRuntime({ process: proc, dyld });
       cf.install?.();
     } catch (err) {
       this._log("warn", "libsystem", `LibSystem falló: ${err.message}`, {
