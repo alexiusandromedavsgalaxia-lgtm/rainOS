@@ -65,6 +65,5 @@ jobs:
           fail_ci_if_error: false
           token: ${{ secrets.CODECOV_TOKEN }}
 
-          git add .
-git commit -m "chore: add GitHub config, CI workflows, project config files"
-git push
+          
+          
